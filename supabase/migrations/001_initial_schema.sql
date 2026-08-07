@@ -135,6 +135,89 @@ create policy read_tickets on tickets for select using (true);
 drop policy if exists read_events on ticket_events;
 create policy read_events on ticket_events for select using (true);
 
+-- ---------------------------------------------------- seeded workflow states
+-- A queue where every ticket sits at RECEIVED cannot show the workflow, and
+-- docs/DEMO.md needs one ticket already parked at the gate with the verifier
+-- objecting. This moves a seeded ticket along the real state machine: it copies
+-- that ticket's own `seed` payload into the live columns, tags it
+-- source: 'seed' so the UI badges it as seeded rather than as live inference,
+-- and writes one audit event per transition — the same rows the server actions
+-- will write later.
+--
+-- Which columns are populated at which status follows the state machine in
+-- docs/ARCHITECTURE.md §4: analysis and draft land together at DRAFTED (the
+-- ANALYZING status covers the analyzer and the drafter), verification and the
+-- computed risk land at VERIFIED.
+create or replace function advance_seeded_ticket(
+  p_id uuid, p_to ticket_status, p_risk text, p_reason text default null
+) returns void
+language plpgsql as $fn$
+declare
+  v_seed   jsonb;
+  v_at     timestamptz;
+  v_chain  ticket_status[];
+  v_from   ticket_status := 'RECEIVED';
+  v_next   ticket_status;
+  v_human  boolean;
+begin
+  select seed, created_at into v_seed, v_at from tickets where id = p_id;
+  if v_seed is null then return; end if;
+
+  -- Idempotent: events only exist once this has run, and reset_demo() deletes
+  -- the tickets (cascading the events away) before re-seeding.
+  if exists (select 1 from ticket_events where ticket_id = p_id) then return; end if;
+
+  v_chain := case p_to
+    when 'DRAFTED' then
+      array['ANALYZING','DRAFTED']::ticket_status[]
+    when 'AWAITING_APPROVAL' then
+      array['ANALYZING','DRAFTED','VERIFIED','AWAITING_APPROVAL']::ticket_status[]
+    when 'EXECUTED' then
+      array['ANALYZING','DRAFTED','VERIFIED','AWAITING_APPROVAL','APPROVED','EXECUTED']::ticket_status[]
+    else null
+  end;
+  if v_chain is null then
+    raise exception 'advance_seeded_ticket: unsupported target status %', p_to;
+  end if;
+
+  foreach v_next in array v_chain loop
+    v_at := v_at + interval '4 minutes';
+    v_human := v_next in ('APPROVED','REJECTED','EXECUTED');
+    insert into ticket_events (ticket_id, created_at, actor, from_status, to_status, reason, source, model)
+    values (
+      p_id, v_at,
+      case when v_human then 'human' else 'ai' end,
+      v_from, v_next,
+      case
+        when v_next = 'ANALYZING'          then 'Classifying category and severity, extracting evidence.'
+        when v_next = 'DRAFTED'            then 'Drafted a customer response and proposed one action.'
+        when v_next = 'VERIFIED'           then 'Independent check of the draft against the ticket.'
+        when v_next = 'AWAITING_APPROVAL'  then 'Decision assembled and parked for a human.'
+        when v_next = 'APPROVED'           then coalesce(p_reason, 'Approved by the operator.')
+        when v_next = 'EXECUTED'           then 'Approved action carried out and recorded.'
+      end,
+      case when v_human then null else 'seed'::ai_source end,
+      null
+    );
+    v_from := v_next;
+  end loop;
+
+  update tickets set
+    status   = p_to,
+    analysis = (v_seed->'analysis') || '{"source":"seed"}'::jsonb,
+    draft    = (v_seed->'draft')    || '{"source":"seed"}'::jsonb,
+    verification = case when p_to <> 'DRAFTED'
+      then (v_seed->'verification') || '{"source":"seed"}'::jsonb end,
+    risk     = p_risk,
+    execution_result = case when p_to = 'EXECUTED' then jsonb_build_object(
+      'executedAt', v_at,
+      'action',     v_seed#>>'{draft,action,type}',
+      'simulated',  true,
+      'detail',     'Reply recorded as sent. No email provider is wired for the demo, so delivery is simulated.'
+    ) end
+  where id = p_id;
+end $fn$;
+
 -- ------------------------------------------------------------------- seed
 -- Five tickets, fixed ids, spanning the five categories and the LOW/MEDIUM/HIGH
 -- risk range. Every ticket carries its own `seed` payload — a plausible
@@ -321,6 +404,25 @@ begin
       }
     }$j$::jsonb
   ) on conflict (id) do nothing;
+
+  -- Advance four of the five along the real state machine so the queue shows the
+  -- workflow rather than five identical rows. Risk values are the documented
+  -- formula (docs/ARCHITECTURE.md §4) applied by hand to each ticket; when
+  -- computeRisk() lands it must reproduce them, which is what its test asserts:
+  --   1: MEDIUM(1) + REPLY(0)        + safe(0)  + pro(0)        = 1 → LOW
+  --   2: CRITICAL(3) + ESCALATE_ENG(0) + safe(0) + enterprise(1) = 4 → HIGH
+  --   4: MEDIUM(1) + REFUND(2)       + !safe(1) + enterprise(1) = 5 → HIGH
+  -- Ticket 3 stops at DRAFTED (not yet verified, so risk is not yet computed)
+  -- and ticket 5 stays at RECEIVED, so the queue holds a ticket at every phase.
+  perform advance_seeded_ticket(
+    '11111111-1111-4111-8111-111111111111', 'EXECUTED', 'LOW',
+    'Explanation only, no refund promised. Duplicate authorisation confirmed in the payment log.');
+  perform advance_seeded_ticket(
+    '22222222-2222-4222-8222-222222222222', 'AWAITING_APPROVAL', 'HIGH');
+  perform advance_seeded_ticket(
+    '33333333-3333-4333-8333-333333333333', 'DRAFTED', null);
+  perform advance_seeded_ticket(
+    '44444444-4444-4444-8444-444444444444', 'AWAITING_APPROVAL', 'HIGH');
 
 end $fn$;
 

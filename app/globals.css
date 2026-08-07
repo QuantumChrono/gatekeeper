@@ -27,6 +27,11 @@
   --color-input: var(--input);
   --color-border: var(--border);
   --color-destructive: var(--destructive);
+  /* Risk and status semantics — the one accent the palette allows (CLAUDE.md §6).
+     Never the sole carrier of meaning: every use pairs with a label or icon. */
+  --color-danger: var(--danger);
+  --color-warning: var(--warning);
+  --color-success: var(--success);
   --color-accent-foreground: var(--accent-foreground);
   --color-accent: var(--accent);
   --color-muted-foreground: var(--muted-foreground);
@@ -48,73 +53,90 @@
   --radius-4xl: calc(var(--radius) * 2.6);
 }
 
+/* Neutrals carry a trace of blue (hue 264, chroma ≤ 0.012) rather than sitting at
+   zero chroma. It reads as instrument grey instead of default-template grey, and
+   at this chroma it never competes with the risk colours below.
+
+   Three surfaces, deliberately ordered: --background is the canvas, --card is the
+   panel that sits on it, --sidebar sits between the two. Layering is what carries
+   grouping here, so panels need almost no shadow. */
 :root {
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.145 0 0);
+  --background: oklch(0.984 0.002 264);
+  --foreground: oklch(0.19 0.013 264);
   --card: oklch(1 0 0);
-  --card-foreground: oklch(0.145 0 0);
+  --card-foreground: oklch(0.19 0.013 264);
   --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.145 0 0);
-  --primary: oklch(0.205 0 0);
-  --primary-foreground: oklch(0.985 0 0);
-  --secondary: oklch(0.97 0 0);
-  --secondary-foreground: oklch(0.205 0 0);
-  --muted: oklch(0.97 0 0);
-  --muted-foreground: oklch(0.556 0 0);
-  --accent: oklch(0.97 0 0);
-  --accent-foreground: oklch(0.205 0 0);
+  --popover-foreground: oklch(0.19 0.013 264);
+  --primary: oklch(0.235 0.018 264);
+  --primary-foreground: oklch(0.985 0.002 264);
+  --secondary: oklch(0.962 0.004 264);
+  --secondary-foreground: oklch(0.235 0.018 264);
+  --muted: oklch(0.963 0.004 264);
+  --muted-foreground: oklch(0.508 0.014 264);
+  --accent: oklch(0.951 0.006 264);
+  --accent-foreground: oklch(0.235 0.018 264);
   --destructive: oklch(0.577 0.245 27.325);
-  --border: oklch(0.922 0 0);
-  --input: oklch(0.922 0 0);
-  --ring: oklch(0.708 0 0);
+  /* Muted next to the neutral palette on purpose: these mark risk, not brand. */
+  --danger: oklch(0.518 0.176 25.5);
+  --warning: oklch(0.545 0.118 62);
+  --success: oklch(0.497 0.104 156);
+  --border: oklch(0.906 0.005 264);
+  --input: oklch(0.906 0.005 264);
+  /* Neutral and dark enough to read as a focus ring on every surface without
+     introducing a second accent colour. */
+  --ring: oklch(0.44 0.02 264);
   --chart-1: oklch(0.87 0 0);
   --chart-2: oklch(0.556 0 0);
   --chart-3: oklch(0.439 0 0);
   --chart-4: oklch(0.371 0 0);
   --chart-5: oklch(0.269 0 0);
-  --radius: 0.625rem;
-  --sidebar: oklch(0.985 0 0);
-  --sidebar-foreground: oklch(0.145 0 0);
-  --sidebar-primary: oklch(0.205 0 0);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.97 0 0);
-  --sidebar-accent-foreground: oklch(0.205 0 0);
-  --sidebar-border: oklch(0.922 0 0);
-  --sidebar-ring: oklch(0.708 0 0);
+  /* Crisp over pillowy: this is an operations console, not a marketing page. */
+  --radius: 0.375rem;
+  --sidebar: oklch(0.971 0.004 264);
+  --sidebar-foreground: oklch(0.19 0.013 264);
+  --sidebar-primary: oklch(0.235 0.018 264);
+  --sidebar-primary-foreground: oklch(0.985 0.002 264);
+  --sidebar-accent: oklch(0.94 0.006 264);
+  --sidebar-accent-foreground: oklch(0.235 0.018 264);
+  --sidebar-border: oklch(0.9 0.006 264);
+  --sidebar-ring: oklch(0.44 0.02 264);
 }
 
 .dark {
-  --background: oklch(0.145 0 0);
-  --foreground: oklch(0.985 0 0);
-  --card: oklch(0.205 0 0);
-  --card-foreground: oklch(0.985 0 0);
-  --popover: oklch(0.205 0 0);
-  --popover-foreground: oklch(0.985 0 0);
-  --primary: oklch(0.922 0 0);
-  --primary-foreground: oklch(0.205 0 0);
-  --secondary: oklch(0.269 0 0);
-  --secondary-foreground: oklch(0.985 0 0);
-  --muted: oklch(0.269 0 0);
-  --muted-foreground: oklch(0.708 0 0);
-  --accent: oklch(0.269 0 0);
-  --accent-foreground: oklch(0.985 0 0);
+  --background: oklch(0.164 0.008 264);
+  --foreground: oklch(0.968 0.003 264);
+  --card: oklch(0.208 0.009 264);
+  --card-foreground: oklch(0.968 0.003 264);
+  --popover: oklch(0.208 0.009 264);
+  --popover-foreground: oklch(0.968 0.003 264);
+  --primary: oklch(0.92 0.004 264);
+  --primary-foreground: oklch(0.208 0.009 264);
+  --secondary: oklch(0.26 0.01 264);
+  --secondary-foreground: oklch(0.968 0.003 264);
+  --muted: oklch(0.256 0.01 264);
+  --muted-foreground: oklch(0.702 0.012 264);
+  --accent: oklch(0.284 0.011 264);
+  --accent-foreground: oklch(0.968 0.003 264);
   --destructive: oklch(0.704 0.191 22.216);
+  --danger: oklch(0.72 0.155 25.5);
+  --warning: oklch(0.79 0.13 68);
+  --success: oklch(0.75 0.13 158);
   --border: oklch(1 0 0 / 10%);
   --input: oklch(1 0 0 / 15%);
-  --ring: oklch(0.556 0 0);
+  --ring: oklch(0.72 0.015 264);
   --chart-1: oklch(0.87 0 0);
   --chart-2: oklch(0.556 0 0);
   --chart-3: oklch(0.439 0 0);
   --chart-4: oklch(0.371 0 0);
   --chart-5: oklch(0.269 0 0);
-  --sidebar: oklch(0.205 0 0);
-  --sidebar-foreground: oklch(0.985 0 0);
-  --sidebar-primary: oklch(0.488 0.243 264.376);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.269 0 0);
-  --sidebar-accent-foreground: oklch(0.985 0 0);
+  --sidebar: oklch(0.186 0.009 264);
+  --sidebar-foreground: oklch(0.968 0.003 264);
+  --sidebar-primary: oklch(0.92 0.004 264);
+  --sidebar-primary-foreground: oklch(0.208 0.009 264);
+  --sidebar-accent: oklch(0.268 0.011 264);
+  --sidebar-accent-foreground: oklch(0.968 0.003 264);
   --sidebar-border: oklch(1 0 0 / 10%);
-  --sidebar-ring: oklch(0.556 0 0);
+  --sidebar-ring: oklch(0.72 0.015 264);
 }
 
 @layer base {
@@ -123,8 +145,48 @@
   }
   body {
     @apply bg-background text-foreground;
+    /* Slightly tighter than default for a dense reading surface. */
+    letter-spacing: -0.006em;
   }
   html {
     @apply font-sans;
+  }
+  /* Identifiers, timestamps and counts must never reflow as their digits change. */
+  :where(code, kbd, samp, .font-mono) {
+    font-variant-numeric: tabular-nums;
+  }
+  ::selection {
+    @apply bg-foreground/12;
+  }
+  /* Transitions here are for orientation only, so honour the OS preference. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+@layer utilities {
+  /* One focus treatment for every interactive surface in the app. Defined once
+     so a link in the queue and a button at the gate cannot drift apart. */
+  .focus-ring {
+    outline: none;
+  }
+  .focus-ring:focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
+  }
+  /* Micro-label: the section and column vocabulary of the console. */
+  .label-xs {
+    font-size: 0.6875rem;
+    line-height: 1rem;
+    font-weight: 500;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--muted-foreground);
   }
 }
