@@ -100,7 +100,7 @@ export type Verification = VerificationFields &
  * failure therefore cannot advance anything, which is the property worth having.
  */
 export type PipelineError = {
-  stage: "analyze" | "draft" | "verify"
+  stage: "analyze" | "draft" | "verify" | "pipeline"
   message: string
   at: string
 }

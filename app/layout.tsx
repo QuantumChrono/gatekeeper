@@ -1,9 +1,7 @@
-import { Suspense } from "react";
 import type { Metadata } from "next";
 import { Geist_Mono, Inter } from "next/font/google";
 import "./globals.css";
 import { cn } from "@/lib/utils";
-import { AppSidebar } from "@/components/app-sidebar";
 
 // Two families, both used: Inter carries prose and UI, Geist Mono carries
 // identifiers, statuses and timestamps. A third would be a download for nothing.
@@ -33,21 +31,13 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
         >
           Skip to content
         </a>
-        {/* Optimised for a laptop: the sidebar is permanent from lg up. Below
-            that it becomes a top bar — a drawer would add a client component
-            and a toggle for a layout the demo never runs at. */}
-        <div className="flex min-h-full flex-1 flex-col lg:grid lg:grid-cols-[15rem_minmax(0,1fr)]">
-          <header className="border-b bg-sidebar lg:sticky lg:top-0 lg:h-dvh lg:overflow-y-auto lg:border-r lg:border-b-0">
-            {/* Nav marks the active surface from the URL, so it reads search
-                params — Suspense keeps that out of the layout's render path. */}
-            <Suspense fallback={null}>
-              <AppSidebar />
-            </Suspense>
-          </header>
-          <main id="main" className="min-w-0 flex-1">
-            {children}
-          </main>
-        </div>
+        {/* The console chrome is not here: the sidebar's workflow trail reflects
+            the open ticket's status, and a layout cannot read that from the page
+            below it. The two operator surfaces render <ConsoleShell> themselves,
+            which also keeps the customer-facing route from inheriting a sidebar
+            it has no business showing. Each surface owns the #main the skip link
+            targets. */}
+        {children}
       </body>
     </html>
   );

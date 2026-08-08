@@ -23,6 +23,7 @@ import {
   WorkflowProgress,
   statusLabel,
 } from "@/components/badges"
+import { ConsoleShell } from "@/components/console-shell"
 import { DecisionControls } from "@/components/decision-controls"
 import { Notice } from "@/components/notice"
 import { Badge } from "@/components/ui/badge"
@@ -479,19 +480,23 @@ export default async function TicketPage(props: PageProps<"/tickets/[id]">) {
   const result = await getTicket(id)
 
   if (!result.ok) {
+    // No ticket loaded, so the trail is given no status to reflect rather than a
+    // guessed one.
     return (
-      <div className="mx-auto max-w-3xl px-5 py-6 lg:px-8 lg:py-8">
-        <Link
-          href="/"
-          className="focus-ring mb-6 inline-flex items-center gap-1.5 text-[13px] text-muted-foreground transition-colors hover:text-foreground"
-        >
-          <ArrowLeft aria-hidden="true" className="size-3.5" />
-          Queue
-        </Link>
-        <Notice tone="error" title="This ticket could not be loaded">
-          {result.message}
-        </Notice>
-      </div>
+      <ConsoleShell>
+        <div className="mx-auto max-w-3xl px-5 py-6 lg:px-8 lg:py-8">
+          <Link
+            href="/"
+            className="focus-ring mb-6 inline-flex items-center gap-1.5 text-[13px] text-muted-foreground transition-colors hover:text-foreground"
+          >
+            <ArrowLeft aria-hidden="true" className="size-3.5" />
+            Queue
+          </Link>
+          <Notice tone="error" title="This ticket could not be loaded">
+            {result.message}
+          </Notice>
+        </div>
+      </ConsoleShell>
     )
   }
 
@@ -502,6 +507,9 @@ export default async function TicketPage(props: PageProps<"/tickets/[id]">) {
   const blocked = verification ? !verification.safeToSend : false
 
   return (
+    // The one surface with an open ticket, so the sidebar trail gets its status
+    // and stops asserting a position it cannot know.
+    <ConsoleShell activeStatus={ticket.status}>
     <div className="mx-auto max-w-3xl space-y-8 px-5 py-6 lg:px-8 lg:py-8">
       <Header ticket={ticket} />
 
@@ -914,5 +922,6 @@ export default async function TicketPage(props: PageProps<"/tickets/[id]">) {
         every call.
       </p>
     </div>
+    </ConsoleShell>
   )
 }

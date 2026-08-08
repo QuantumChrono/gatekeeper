@@ -16,6 +16,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
+import { ConsoleShell } from "@/components/console-shell"
 import { getTickets } from "@/lib/db"
 import { formatAge, tierLabel } from "@/lib/format"
 import { TERMINAL } from "@/lib/types"
@@ -130,14 +131,16 @@ export default async function QueuePage(props: PageProps<"/">) {
 
   if (!result.ok) {
     return (
-      <div className="mx-auto max-w-6xl px-5 py-6 lg:px-8 lg:py-8">
-        <h1 className="mb-6 text-base font-semibold tracking-tight">
-          Ticket queue
-        </h1>
-        <Notice tone="error" title="The queue could not be loaded">
-          {result.message}
-        </Notice>
-      </div>
+      <ConsoleShell>
+        <div className="mx-auto max-w-6xl px-5 py-6 lg:px-8 lg:py-8">
+          <h1 className="mb-6 text-base font-semibold tracking-tight">
+            Ticket queue
+          </h1>
+          <Notice tone="error" title="The queue could not be loaded">
+            {result.message}
+          </Notice>
+        </div>
+      </ConsoleShell>
     )
   }
 
@@ -145,6 +148,7 @@ export default async function QueuePage(props: PageProps<"/">) {
   const tickets = active ? all.filter((t) => t.status === active) : all
 
   return (
+    <ConsoleShell>
     <div className="mx-auto max-w-6xl px-5 py-6 lg:px-8 lg:py-8">
       <header className="flex flex-col gap-6 lg:flex-row lg:items-start lg:justify-between lg:gap-10">
         <div className="max-w-xl space-y-1.5">
@@ -278,5 +282,6 @@ export default async function QueuePage(props: PageProps<"/">) {
         )}
       </div>
     </div>
+    </ConsoleShell>
   )
 }

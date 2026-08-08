@@ -1,6 +1,8 @@
 "use server"
 
 import { revalidatePath } from "next/cache"
+import { after } from "next/server"
+import { z } from "zod"
 
 import {
   analyze,
@@ -8,7 +10,12 @@ import {
   verify,
   type TicketInput,
 } from "@/lib/ai/stages"
-import { getPipelineTicket, store, type PipelineTicket } from "@/lib/db"
+import {
+  createTicket,
+  getPipelineTicket,
+  store,
+  type PipelineTicket,
+} from "@/lib/db"
 import { transition } from "@/lib/workflow"
 import type { Analysis, Draft, Result, Status } from "@/lib/types"
 
@@ -104,7 +111,20 @@ export async function runPipeline(
 ): Promise<ActionState> {
   const id = ticketId(formData)
   if (!id) return fail("No valid ticket id was supplied, so nothing was run.")
+  return advanceThroughStages(id)
+}
 
+/**
+ * The stages themselves, separated from the form that usually starts them.
+ *
+ * Two callers reach the pipeline — an operator pressing the button on the detail
+ * view, and a ticket arriving through the customer portal — and they must run the
+ * *same* stages against the same guarded transitions. A second copy shaped for
+ * the portal would be a second state machine, which is the one thing CLAUDE.md §2
+ * forbids. Not exported: it is reached through `runPipeline` or from the portal
+ * submission on this server, never as its own endpoint.
+ */
+async function advanceThroughStages(id: string): Promise<ActionState> {
   const read = await getPipelineTicket(id)
   if (!read.ok) return fail(read.message)
 
@@ -219,6 +239,130 @@ export async function runPipeline(
   return fail(
     `This ticket is at ${status}, which is past the automated stages, so the pipeline had nothing to run.`
   )
+}
+
+// ------------------------------------------------------------ customer intake
+// The one write that does not move a ticket through the state machine: it creates
+// one at the start of it. Everything a customer sends is untrusted, and this is
+// the widest trust boundary in the app — it is reachable by anyone who can reach
+// the portal, with no operator behind it — so the fields are validated here
+// before a database or a model sees them.
+
+/**
+ * What the portal form may contain. Bounded on purpose: `body` reaches a model,
+ * so an unbounded one is both a cost and an availability problem, and a limit is
+ * the only thing standing where an authenticated session normally would.
+ *
+ * `trim()` before the length check, so whitespace cannot satisfy a required field.
+ */
+const SubmissionSchema = z.object({
+  customer_name: z
+    .string()
+    .trim()
+    .min(1, "Enter your name.")
+    .max(120, "This name is longer than 120 characters."),
+  // The tier vocabulary the tickets table checks. A value outside it is not a
+  // typo to explain, it is a tampered form field.
+  customer_tier: z.enum(["free", "pro", "enterprise"], {
+    message: "Choose one of the listed plans.",
+  }),
+  subject: z
+    .string()
+    .trim()
+    .min(1, "Enter a subject.")
+    .max(200, "Keep the subject under 200 characters."),
+  body: z
+    .string()
+    .trim()
+    .min(1, "Describe the problem so we can help.")
+    .max(4000, "Keep the message under 4000 characters."),
+})
+
+/** What the portal form gets back. Field errors so the form can point at them. */
+export type SubmissionState =
+  | { ok: true; reference: string }
+  | { ok: false; message: string; errors?: Record<string, string> }
+  | null
+
+/**
+ * Accept a ticket from a customer, then start the AI stages behind the response.
+ *
+ * The ticket lands at RECEIVED and nothing about the decision is decided here.
+ * The stages run through `advanceThroughStages`, which is the same guarded path
+ * the operator's button uses, so a ticket arriving this way is subject to the
+ * identical state machine — and its furthest reachable status is
+ * AWAITING_APPROVAL. A ticket cannot approve or execute itself by being submitted,
+ * whatever its text asks for.
+ */
+export async function submitTicket(
+  _prev: SubmissionState,
+  formData: FormData
+): Promise<SubmissionState> {
+  const parsed = SubmissionSchema.safeParse({
+    customer_name: formData.get("customer_name"),
+    customer_tier: formData.get("customer_tier"),
+    subject: formData.get("subject"),
+    body: formData.get("body"),
+  })
+
+  if (!parsed.success) {
+    // The schema's own messages, which are written above for a customer to read.
+    const errors: Record<string, string> = {}
+    for (const issue of parsed.error.issues) {
+      const field = issue.path[0]
+      if (typeof field === "string" && !errors[field]) {
+        errors[field] = issue.message
+      }
+    }
+    return {
+      ok: false,
+      message: "This form could not be submitted. Check the fields below.",
+      errors,
+    }
+  }
+
+  const created = await createTicket(parsed.data)
+  if (!created.ok) return { ok: false, message: created.message }
+
+  const { id } = created.data
+
+  // The customer's confirmation does not wait on three model calls. The stages
+  // run after the response, and a failure inside them is recorded on the ticket
+  // as a pipeline error — the ticket stays at RECEIVED and an operator sees why,
+  // which is the honest outcome rather than a submission that appears to fail
+  // after it has already been accepted.
+  after(async () => {
+    try {
+      const result = await advanceThroughStages(id)
+      // AI stage failures are already recorded by `stageFailed`, but transition
+      // rejections and missing-data paths return fail() without recording. A
+      // portal-submitted ticket that stalls for one of those reasons would have
+      // no pipeline_error on the row, so the operator would not see why it
+      // stopped. Record it here so the stall is always visible.
+      if (result && !result.ok) {
+        await store.recordFailure({
+          ticketId: id,
+          error: {
+            stage: "pipeline",
+            message: result.message,
+            at: new Date().toISOString(),
+          },
+        })
+      }
+    } catch {
+      // Already-accepted work must not surface as an unhandled rejection. The
+      // stages record their own failures against the ticket; nothing is logged
+      // here because provider errors can echo request contents (CLAUDE.md §7).
+    }
+  })
+
+  // The queue reads through `connection()`, so it is never served from a cache
+  // and this ticket is visible on the operator's next load either way. Revalidated
+  // regardless, because the detail route it links to is the one an operator opens
+  // straight after.
+  refreshViews(id)
+
+  return { ok: true, reference: id }
 }
 
 /**

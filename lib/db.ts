@@ -236,6 +236,44 @@ export async function getPipelineTicket(
 }
 
 /**
+ * Insert a ticket at RECEIVED and hand back its id.
+ *
+ * Written with the service-role client like every other mutation: the anon key
+ * the browser holds has no insert policy, so a ticket cannot be created from a
+ * client component even if someone drives the Supabase client directly
+ * (CLAUDE.md §7). The caller is a Server Action that has already validated the
+ * fields.
+ *
+ * `status` is not passed. The column defaults to RECEIVED, and the receipt
+ * trigger writes the first audit event from the row itself — so an arriving
+ * ticket cannot be inserted mid-workflow, and its trail starts where the ticket
+ * actually started.
+ */
+export async function createTicket(fields: {
+  subject: string
+  body: string
+  customer_name: string
+  customer_tier: Ticket["customer_tier"]
+}): Promise<Result<{ id: string }>> {
+  const db = writer()
+  if (!db) return { ok: false, message: NO_WRITE_KEY }
+
+  const { data, error } = await db
+    .from("tickets")
+    .insert(fields)
+    .select("id")
+    .single<{ id: string }>()
+
+  if (error) {
+    return {
+      ok: false,
+      message: `This ticket could not be submitted: ${error.message}.`,
+    }
+  }
+  return { ok: true, data }
+}
+
+/**
  * The one implementation of the state machine's write port.
  *
  * It holds no policy: `canTransition` in lib/workflow.ts decides what may move
