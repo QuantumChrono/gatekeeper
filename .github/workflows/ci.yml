@@ -36,8 +36,16 @@ jobs:
 
       - run: pnpm test
 
+      - name: Install Playwright Browsers
+        run: pnpm exec playwright install --with-deps
+
       - name: Run Playwright end-to-end tests
         run: pnpm test:e2e --reporter=html
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GOOGLE_GENERATIVE_AI_API_KEY }}
 
       - name: Upload Playwright report
         if: always()
@@ -47,7 +55,4 @@ jobs:
           path: playwright-report
           if-no-files-found: error
 
-      # No secrets: both routes are dynamic and the missing database and AI keys
-      # are handled paths, not build-time failures. Verified with .env.local
-      # moved aside.
       - run: pnpm build
