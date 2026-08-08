@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# Pushing again to the same ref cancels the run already in flight rather than
+# leaving it to finish against a commit nobody is looking at any more.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Before setup-node, which needs pnpm on PATH to resolve its store for the
+      # cache key. Version is pinned here because package.json has no
+      # `packageManager` field for the action to read.
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm lint
+
+      - run: pnpm typecheck
+
+      - run: pnpm test
+
+      # No secrets: both routes are dynamic and the missing database and AI keys
+      # are handled paths, not build-time failures. Verified with .env.local
+      # moved aside.
+      - run: pnpm build
