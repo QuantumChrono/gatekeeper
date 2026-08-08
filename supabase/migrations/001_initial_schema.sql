@@ -171,6 +171,34 @@ create table if not exists ticket_events (
   model       text
 );
 
+-- Receipt is a workflow event like any other, so it is on the trail like any
+-- other. Without this the record of a ticket begins at RECEIVED → ANALYZING and
+-- the arrival itself is only implied by the ticket's own created_at — an operator
+-- reading the trail sees the system's first act, not the ticket's.
+--
+-- A trigger rather than an insert in the application: arrival is not a transition
+-- (there is no from-status to leave) and it is not a decision anyone makes, it is
+-- the row existing. Writing it here means no insert path can forget it, and the
+-- event carries the row's own created_at rather than a second clock's opinion of
+-- when the ticket arrived.
+--
+-- actor 'system': nothing was inferred and nobody authorized anything.
+create or replace function tickets_record_receipt() returns trigger
+language plpgsql as $fn$
+begin
+  insert into ticket_events
+    (ticket_id, created_at, actor, from_status, to_status, reason)
+  values (
+    new.id, new.created_at, 'system', null, new.status,
+    'Ticket received. Nothing has been inferred and nothing has been authorized.'
+  );
+  return new;
+end $fn$;
+
+drop trigger if exists record_receipt on tickets;
+create trigger record_receipt after insert on tickets
+  for each row execute function tickets_record_receipt();
+
 -- Append-only, enforced by the database rather than by convention.
 -- An event never changes and is never deleted while its ticket exists. The sole
 -- permitted delete is the cascade from dropping the ticket itself (demo reset):
@@ -190,6 +218,36 @@ drop trigger if exists no_mutate_events on ticket_events;
 create trigger no_mutate_events before update or delete on ticket_events
   for each row execute function ticket_events_immutable();
 
+-- ----------------------------------------------------------------- policies
+-- Operational and policy reference text, keyed so it can be retrieved by exact
+-- match rather than searched. This is the third table, against the two-table
+-- target in CLAUDE.md §2, and the justification is that the alternative is worse:
+-- the only other places this text could live are a hardcoded TypeScript constant
+-- (reference data pretending not to be data, uncitable and unversioned) or a
+-- model prompt (inventing policy, which is the exact failure the verifier exists
+-- to catch). An operator deciding a refund needs to see the rule they are
+-- deciding against, and it has to be real.
+--
+-- Retrieval is a keyed lookup and deliberately not a search (out of scope, §4):
+-- a row applies to a category, to a proposed action type, or to both, and a row
+-- with neither is general guidance that always applies. No embeddings, no
+-- ranking model — the match is equality and the order is fixed below.
+create table if not exists policies (
+  -- A stable slug rather than a uuid: it is a citation, and a citation that
+  -- changes when the table is re-seeded is not a citation.
+  id          text primary key,
+  title       text not null,
+  body        text not null,
+  -- Where this rule comes from, so the operator can go and read the source.
+  source_ref  text not null,
+  -- Same vocabularies as the analysis and draft checks above. Null means "not
+  -- keyed on this axis", so it does not narrow the match.
+  category    text check (category is null or category in
+                ('BILLING','BUG','ACCOUNT_ACCESS','REFUND','FEATURE_REQUEST')),
+  action_type text check (action_type is null or action_type in
+                ('REPLY','ESCALATE_T2','ESCALATE_ENG','REFUND','CLOSE'))
+);
+
 -- ---------------------------------------------------------------- indexes
 
 create index if not exists tickets_status_idx on tickets (status);
@@ -203,12 +261,18 @@ create index if not exists ticket_events_ticket_idx on ticket_events (ticket_id,
 
 alter table tickets       enable row level security;
 alter table ticket_events enable row level security;
+alter table policies      enable row level security;
 
 drop policy if exists read_tickets on tickets;
 create policy read_tickets on tickets for select using (true);
 
 drop policy if exists read_events on ticket_events;
 create policy read_events on ticket_events for select using (true);
+
+-- Reference text an operator reads while deciding. Select only, like the rest:
+-- no write policy exists, so the browser cannot edit the rule it is being held to.
+drop policy if exists read_policies on policies;
+create policy read_policies on policies for select using (true);
 
 -- ------------------------------------------------- guarded transition writes
 -- One function, one transaction: the conditional status change, the artifact it
@@ -350,9 +414,16 @@ begin
   select seed, created_at into v_seed, v_at from tickets where id = p_id;
   if v_seed is null then return; end if;
 
-  -- Idempotent: events only exist once this has run, and reset_demo() deletes
-  -- the tickets (cascading the events away) before re-seeding.
-  if exists (select 1 from ticket_events where ticket_id = p_id) then return; end if;
+  -- Idempotent: transition events only exist once this has run, and reset_demo()
+  -- deletes the tickets (cascading the events away) before re-seeding.
+  --
+  -- Restricted to transitions on purpose. Every ticket carries a receipt event
+  -- from the moment it is inserted, so a bare "does this ticket have any event"
+  -- test would be true for every ticket and this function would advance nothing.
+  if exists (
+    select 1 from ticket_events
+    where ticket_id = p_id and from_status is not null
+  ) then return; end if;
 
   v_chain := case p_to
     when 'DRAFTED' then
@@ -448,7 +519,7 @@ begin
         }
       },
       "draft": {
-        "response": "Hi Priya,\n\nThanks for flagging this, and for the detail on the dates.\n\nI can see two authorisations of 49.00 USD dated 3 March against your account. One is the March subscription charge; the second is a duplicate raised when the first payment attempt was retried. Only one invoice was issued, which is why the portal shows a single entry.\n\nI have asked billing to void the duplicate authorisation. It will drop off your statement within three to five business days without any action from you, and no credit note is needed because the second charge was never captured as revenue.\n\nIf it is still showing after five business days, reply here and I will chase it directly.\n\nBest regards,\nSupport",
+        "proposedResponse": "Hi Priya,\n\nThanks for flagging this, and for the detail on the dates.\n\nI can see two authorisations of 49.00 USD dated 3 March against your account. One is the March subscription charge; the second is a duplicate raised when the first payment attempt was retried. Only one invoice was issued, which is why the portal shows a single entry.\n\nI have asked billing to void the duplicate authorisation. It will drop off your statement within three to five business days without any action from you, and no credit note is needed because the second charge was never captured as revenue.\n\nIf it is still showing after five business days, reply here and I will chase it directly.\n\nBest regards,\nSupport",
         "proposedAction": {
           "type": "REPLY",
           "params": {},
@@ -494,7 +565,7 @@ begin
         }
       },
       "draft": {
-        "response": "Hi Marcus,\n\nThank you for the report, and for the error signature and timing — both are useful.\n\nI have escalated this to our on-call engineering team as a critical incident and included the endpoint, the upstream timeout signature, and the correlation with this morning deploy. They are picking it up now.\n\nI will come back to you with an update as soon as engineering has confirmed the cause, and sooner if they need anything further from you. If your queue backlog is at risk of overflowing before then, tell me and I will raise that alongside the incident.\n\nBest regards,\nSupport",
+        "proposedResponse": "Hi Marcus,\n\nThank you for the report, and for the error signature and timing — both are useful.\n\nI have escalated this to our on-call engineering team as a critical incident and included the endpoint, the upstream timeout signature, and the correlation with this morning deploy. They are picking it up now.\n\nI will come back to you with an update as soon as engineering has confirmed the cause, and sooner if they need anything further from you. If your queue backlog is at risk of overflowing before then, tell me and I will raise that alongside the incident.\n\nBest regards,\nSupport",
         "proposedAction": {
           "type": "ESCALATE_ENG",
           "params": { "queue": "engineering-oncall", "incident_severity": "critical" },
@@ -540,7 +611,7 @@ begin
         }
       },
       "draft": {
-        "response": "Hi Dana,\n\nSorry about this — losing the authenticator and the backup codes together is a genuinely awkward position to be in.\n\nI cannot reset two factor authentication from a support ticket, because doing so on request alone is exactly the path an account takeover would use. I have passed this to our account security team, who can verify your identity through a separate channel and then reset the second factor.\n\nThey will contact you directly. I have also flagged that our reset emails are not reaching you, so they can check for a delivery problem on that address rather than sending you down the same path again.\n\nBest regards,\nSupport",
+        "proposedResponse": "Hi Dana,\n\nSorry about this — losing the authenticator and the backup codes together is a genuinely awkward position to be in.\n\nI cannot reset two factor authentication from a support ticket, because doing so on request alone is exactly the path an account takeover would use. I have passed this to our account security team, who can verify your identity through a separate channel and then reset the second factor.\n\nThey will contact you directly. I have also flagged that our reset emails are not reaching you, so they can check for a delivery problem on that address rather than sending you down the same path again.\n\nBest regards,\nSupport",
         "proposedAction": {
           "type": "ESCALATE_T2",
           "params": { "queue": "account-security", "verification_required": true },
@@ -593,7 +664,7 @@ begin
         }
       },
       "draft": {
-        "response": "Hi Tomas,\n\nThanks for getting in touch, and I understand the timing pressure from your procurement team.\n\nI can see the 499.00 USD annual renewal on the account. Before I can process a refund I need to locate the cancellation you sent on the 14th — I am not finding it against this account. If you can forward the original message, or tell me the address it was sent from, I can match it and confirm the date it reached us.\n\nIf the cancellation did land before the renewal, the refund is straightforward and I will raise it as soon as that is confirmed.\n\nBest regards,\nSupport",
+        "proposedResponse": "Hi Tomas,\n\nThanks for getting in touch, and I understand the timing pressure from your procurement team.\n\nI can see the 499.00 USD annual renewal on the account. Before I can process a refund I need to locate the cancellation you sent on the 14th — I am not finding it against this account. If you can forward the original message, or tell me the address it was sent from, I can match it and confirm the date it reached us.\n\nIf the cancellation did land before the renewal, the refund is straightforward and I will raise it as soon as that is confirmed.\n\nBest regards,\nSupport",
         "proposedAction": {
           "type": "REFUND",
           "params": { "amount_cents": 49900, "currency": "USD", "reason": "Annual renewal charged after a cancellation the customer states was sent on the 14th." },
@@ -644,7 +715,7 @@ begin
         }
       },
       "draft": {
-        "response": "Hi Ellis,\n\nThanks for taking the time to suggest this — and for the context on why, which is the part that makes a request useful to our product team.\n\nA dark theme is on our list and this is not the first time it has come up. I have added your note to the product feedback record so it counts toward how we prioritise it. I cannot give you a date, and I would rather say that than invent one.\n\nIn the meantime, if your operating system has a system-wide dark setting, the reading views in the dashboard will follow it, though the main interface does not yet.\n\nBest regards,\nSupport",
+        "proposedResponse": "Hi Ellis,\n\nThanks for taking the time to suggest this — and for the context on why, which is the part that makes a request useful to our product team.\n\nA dark theme is on our list and this is not the first time it has come up. I have added your note to the product feedback record so it counts toward how we prioritise it. I cannot give you a date, and I would rather say that than invent one.\n\nIn the meantime, if your operating system has a system-wide dark setting, the reading views in the dashboard will follow it, though the main interface does not yet.\n\nBest regards,\nSupport",
         "proposedAction": {
           "type": "REPLY",
           "params": {},
@@ -662,6 +733,139 @@ begin
       }
     }$j$::jsonb
   ) on conflict (id) do nothing;
+
+  -- ---------------------------------------------------------------- history
+  -- Closed tickets, older than the five above, that the evidence panel retrieves
+  -- as prior context. They exist because the alternative is a panel that is
+  -- always empty: the five live tickets have five distinct customers and five
+  -- distinct categories, so nothing relates to anything and "relevant previous
+  -- ticket" would be a heading over nothing.
+  --
+  -- Each one is keyed to be retrieved by the deterministic rules in lib/db.ts:
+  -- the first shares Tomas Lindqvist's account with ticket 4 (the HIGH-risk
+  -- refund), the second shares BILLING with ticket 1, the third shares
+  -- ACCOUNT_ACCESS with ticket 3. All are terminal, so they sit in the queue's
+  -- closed count and never move again.
+  --
+  -- created_at is set back explicitly. These are history, and a "previous ticket"
+  -- stamped later than the ticket citing it would be a lie in the one panel whose
+  -- whole job is chronology.
+
+  insert into tickets (id, created_at, subject, body, customer_name, customer_tier, order_value_cents, seed)
+  values (
+    'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    now() - interval '96 days',
+    $b$Duplicate annual charge after switching payment method$b$,
+    $b$We switched our card in January and were charged the annual amount twice in the same week. We have the cancellation of the first attempt in writing from your billing team. Please confirm which charge stands.$b$,
+    $b$Tomas Lindqvist$b$, 'enterprise', 49900,
+    $j${
+      "analysis": {
+        "category": "REFUND", "severity": "MEDIUM", "sentiment": "NEUTRAL", "confidence": 0.82,
+        "summary": "A duplicate annual charge following a payment method change, with the cancellation confirmable in writing.",
+        "reasoning": [
+          "A duplicate charge where the customer states the cancellation exists in writing from our own billing team.",
+          "The deciding record was locatable, which is what separated this from an unevidenced refund request."
+        ],
+        "evidence": [
+          "We switched our card in January and were charged the annual amount twice in the same week",
+          "We have the cancellation of the first attempt in writing from your billing team"
+        ],
+        "routing": "billing-tier2",
+        "proposedAction": { "type": "REFUND", "rationale": "The cancellation was located in the billing thread, so the entitlement is on record and the duplicate is refundable." }
+      },
+      "draft": {
+        "proposedResponse": "Hi Tomas,\n\nI located the cancellation in our billing thread and matched it to the first of the two charges. The second charge stands as your annual renewal; the first has been refunded in full.\n\nBest regards,\nSupport",
+        "proposedAction": {
+          "type": "REFUND",
+          "params": { "amount_cents": 49900, "currency": "USD", "reason": "Duplicate annual charge; cancellation of the first attempt confirmed in the billing thread." },
+          "rationale": "The cancellation record was located before the refund was raised, which is what the entitlement check requires."
+        }
+      },
+      "verification": {
+        "verificationStatus": "PASS", "confidence": 0.86, "issues": [],
+        "verificationSummary": "The refund rests on a located cancellation record rather than on the customer's assertion, and the amount matches the duplicated charge.",
+        "safeToSend": true
+      }
+    }$j$::jsonb
+  ) on conflict (id) do nothing;
+
+  insert into tickets (id, created_at, subject, body, customer_name, customer_tier, order_value_cents, seed)
+  values (
+    'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+    now() - interval '61 days',
+    $b$Invoice shows a charge we cannot identify$b$,
+    $b$There is a line on our February invoice we cannot match to anything. It is 49.00 USD and the description is blank. Can you tell us what it is for?$b$,
+    $b$Hannah Weiss$b$, 'pro', 4900,
+    $j${
+      "analysis": {
+        "category": "BILLING", "severity": "LOW", "sentiment": "NEUTRAL", "confidence": 0.91,
+        "summary": "An unidentified invoice line that the payment log resolves without any adjustment.",
+        "reasoning": [
+          "An identification question about a single invoice line, answerable from the payment log.",
+          "Nothing is disputed and no adjustment was requested, so this is explanatory rather than financial."
+        ],
+        "evidence": [
+          "There is a line on our February invoice we cannot match to anything",
+          "the description is blank"
+        ],
+        "routing": "billing-tier1",
+        "proposedAction": { "type": "REPLY", "rationale": "The payment log identifies the line, so an explanation closes it." }
+      },
+      "draft": {
+        "proposedResponse": "Hi Hannah,\n\nThat line is the prorated charge for the seat added partway through January. The description was not carried over from the provisioning record, which is why it reached you blank.\n\nBest regards,\nSupport",
+        "proposedAction": { "type": "REPLY", "params": {}, "rationale": "An identification question with an answer in the payment log needs no adjustment." }
+      },
+      "verification": {
+        "verificationStatus": "PASS", "confidence": 0.88, "issues": [],
+        "verificationSummary": "The reply identifies the line from the payment log and commits to nothing further.",
+        "safeToSend": true
+      }
+    }$j$::jsonb
+  ) on conflict (id) do nothing;
+
+  insert into tickets (id, created_at, subject, body, customer_name, customer_tier, order_value_cents, seed)
+  values (
+    'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
+    now() - interval '23 days',
+    $b$Cannot sign in after losing my security key$b$,
+    $b$I lost the hardware key I use for two factor and I have no backup codes saved. I need access to my account back. Can you turn the second factor off for me?$b$,
+    $b$Rafael Ortiz$b$, 'pro', 0,
+    $j${
+      "analysis": {
+        "category": "ACCOUNT_ACCESS", "severity": "HIGH", "sentiment": "FRUSTRATED", "confidence": 0.9,
+        "summary": "Loss of the only second factor, with the customer asking support to disable it outright.",
+        "reasoning": [
+          "The customer has lost their only second factor and has no backup codes.",
+          "The request is for support to disable two factor directly, which identity policy does not permit from a ticket."
+        ],
+        "evidence": [
+          "I lost the hardware key I use for two factor and I have no backup codes saved",
+          "Can you turn the second factor off for me"
+        ],
+        "routing": "account-security",
+        "proposedAction": { "type": "ESCALATE_T2", "rationale": "Disabling a second factor requires identity verification away from the ticket, so account security owns it." }
+      },
+      "draft": {
+        "proposedResponse": "Hi Rafael,\n\nI cannot switch off two factor from a support ticket, because a request alone is the same path an account takeover would take. Our account security team can verify your identity separately and reset it, and I have passed this to them.\n\nBest regards,\nSupport",
+        "proposedAction": { "type": "ESCALATE_T2", "params": { "queue": "account-security", "verification_required": true }, "rationale": "Identity has to be established before any credential changes, which support cannot do from a ticket." }
+      },
+      "verification": {
+        "verificationStatus": "PASS", "confidence": 0.87, "issues": [],
+        "verificationSummary": "The refusal is correct under identity policy and the reply states the reason plainly rather than apologising without one.",
+        "safeToSend": true
+      }
+    }$j$::jsonb
+  ) on conflict (id) do nothing;
+
+  perform advance_seeded_ticket(
+    'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'EXECUTED', 'HIGH',
+    'Cancellation located in the billing thread. Refund approved against the record, not the request.');
+  perform advance_seeded_ticket(
+    'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', 'EXECUTED', 'LOW',
+    'Explanation only. Invoice line identified from the payment log.');
+  perform advance_seeded_ticket(
+    'cccccccc-cccc-4ccc-8ccc-cccccccccccc', 'EXECUTED', 'MEDIUM',
+    'Escalated to account security. No credential was changed from the ticket.');
 
   -- Advance four of the five along the real state machine so the queue shows the
   -- workflow rather than five identical rows. Risk values are the documented
@@ -684,6 +888,58 @@ begin
 
 end $fn$;
 
+-- ------------------------------------------------------------ policy corpus
+-- The rules an operator is deciding against. Reference data, so it is seeded
+-- separately from the tickets and survives reset_demo() — resetting the demo
+-- should not wipe the policy book.
+--
+-- Keys are the vocabularies already validated everywhere else. A row keyed to a
+-- category applies to tickets of that category; a row keyed to an action type
+-- applies whenever that action is proposed; a row with neither always applies.
+-- Both keys set means both must match.
+create or replace function seed_policies() returns void
+language plpgsql as $fn$
+begin
+  insert into policies (id, title, body, source_ref, category, action_type) values
+
+  ('refund-entitlement-check',
+   $b$A refund is authorised only against a record on file$b$,
+   $b$Before a refund is authorised, the entitlement behind it must be confirmed against our own records: the cancellation, the duplicate charge, or the unprovisioned item. A date or an amount asserted in a ticket is a claim, not a record. Where the deciding record cannot be located, the correct action is to request it and hold the refund.$b$,
+   $b$Billing operations handbook, section 4.2$b$, 'REFUND', 'REFUND'),
+
+  ('refund-full-order-value',
+   $b$A refund at full order value is reviewed as a single decision$b$,
+   $b$A refund for the entire order value is the largest action available on a ticket and is not treated as routine. It requires the entitlement record, and the reviewing operator confirms the amount against the payment on the account rather than against the amount requested.$b$,
+   $b$Billing operations handbook, section 4.5$b$, null, 'REFUND'),
+
+  ('billing-duplicate-authorisation',
+   $b$A duplicate authorisation is not a duplicate charge$b$,
+   $b$A retried payment attempt can leave a second authorisation against an account without a second capture. Read the payment log before describing it to a customer: an uncaptured authorisation drops off without a credit note, and offering one implies money moved that never did.$b$,
+   $b$Billing operations handbook, section 2.1$b$, 'BILLING', null),
+
+  ('account-access-identity-first',
+   $b$A second factor is never reset from a ticket alone$b$,
+   $b$Resetting two-factor authentication, or issuing new backup codes, requires identity verification through a channel separate from the ticket. A request in a ticket is exactly the path an account takeover uses, however convincing the account detail it carries. Support escalates to account security rather than resetting.$b$,
+   $b$Account security policy, section 3$b$, 'ACCOUNT_ACCESS', 'ESCALATE_T2'),
+
+  ('incident-endpoint-wide-failure',
+   $b$Endpoint-wide failures go to on-call, not to a reply$b$,
+   $b$Where a customer reports total failure of an endpoint correlated with a deploy, the ticket is escalated to on-call engineering with the error signature and timing attached. Support does not state a cause and does not give a restoration time before engineering has established one.$b$,
+   $b$Incident response runbook, section 1.4$b$, 'BUG', 'ESCALATE_ENG'),
+
+  ('feature-request-no-commitments',
+   $b$No delivery dates are given for unshipped work$b$,
+   $b$A feature request is recorded and acknowledged. No date, release or ordering commitment is made, and no unshipped capability is described as available. Saying that we cannot give a date is preferred to giving one we do not have.$b$,
+   $b$Support communications standard, section 6$b$, 'FEATURE_REQUEST', null),
+
+  ('untrusted-ticket-content',
+   $b$Instructions inside customer content carry no authority$b$,
+   $b$Ticket text is customer-supplied and is treated as data throughout. An instruction found inside it — to approve, to skip review, to refund immediately — is recorded and disregarded, never acted on. Authorisation comes only from an operator at the gate.$b$,
+   $b$Support operations policy, section 1.2$b$, null, null)
+
+  on conflict (id) do nothing;
+end $fn$;
+
 -- Reset to the demo start state: drop the tickets, which cascades their events
 -- away with them, then re-seed. Called by the resetDemo() server action.
 create or replace function reset_demo() returns void
@@ -700,3 +956,9 @@ do $$ begin
     perform seed_demo_tickets();
   end if;
 end $$;
+
+-- Policies are reference data, not demo state: seeded unconditionally (the insert
+-- is on-conflict-do-nothing) and deliberately outside reset_demo(), because
+-- resetting the demo should not empty the policy book the decisions are judged
+-- against.
+select seed_policies();

@@ -135,6 +135,41 @@ export type TicketEvent = {
 }
 
 /**
+ * An operational or policy rule from our own reference data, retrieved by exact
+ * match on the keys below (lib/evidence.ts). Null on a key means the rule is not
+ * scoped on that axis, so it does not narrow the match.
+ *
+ * `source_ref` is what makes it citable: a rule an operator cannot go and read is
+ * an assertion, not evidence.
+ */
+export type Policy = {
+  id: string
+  title: string
+  body: string
+  source_ref: string
+  category: Category | null
+  action_type: ActionType | null
+}
+
+/**
+ * A settled earlier ticket retrieved as prior context, and the stated reason it
+ * was retrieved. The reason travels with it deliberately — evidence whose basis
+ * is not shown is just an adjacent claim.
+ */
+export type PriorTicket = {
+  id: string
+  created_at: string
+  subject: string
+  customer_name: string
+  status: Status
+  risk: Risk | null
+  category: Category | null
+  /** The action actually carried out, where one was. Null on a rejected ticket. */
+  outcome: ActionType | null
+  relation: "Same customer" | "Same category"
+}
+
+/**
  * The happy path through the workflow, in order, for rendering progress.
  * Presentation only — it is not the transition rule. `canTransition` is the
  * authority on legal moves and lands with the server actions that write them.

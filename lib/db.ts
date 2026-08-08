@@ -1,10 +1,13 @@
 import { createClient } from "@supabase/supabase-js"
 import { connection } from "next/server"
 
+import { applicablePolicies, relatedTickets } from "@/lib/evidence"
 import type { TransitionStore } from "@/lib/workflow"
 import type {
   Analysis,
   Draft,
+  Policy,
+  PriorTicket,
   Result,
   Risk,
   Status,
@@ -72,15 +75,32 @@ export async function getTickets(): Promise<Result<Ticket[]>> {
   return { ok: true, data }
 }
 
-export async function getTicket(
-  id: string
-): Promise<Result<{ ticket: Ticket; events: TicketEvent[] }>> {
+/**
+ * Everything the decision detail renders, in one read.
+ *
+ * `policies` and `related` are the evidence behind the recommendation: reference
+ * rules that apply to this ticket, and settled earlier tickets that bear on it.
+ * Both come from the relational data already in the database and are selected by
+ * the exact-match rules in lib/evidence.ts — nothing is embedded, ranked or
+ * searched.
+ */
+export async function getTicket(id: string): Promise<
+  Result<{
+    ticket: Ticket
+    events: TicketEvent[]
+    policies: Policy[]
+    related: PriorTicket[]
+  }>
+> {
   await connection()
   const db = reader()
   if (!db) return { ok: false, message: UNCONFIGURED }
 
-  // Two independent reads — issue them together rather than in series.
-  const [ticketRes, eventsRes] = await Promise.all([
+  // Four independent reads — issued together rather than in series. The two
+  // evidence reads do not depend on the ticket: they are filtered in code once it
+  // has landed, which keeps retrieval a pure function of data we already hold
+  // rather than a second round trip shaped by the first.
+  const [ticketRes, eventsRes, policiesRes, candidatesRes] = await Promise.all([
     db.from("tickets").select(TICKET_COLUMNS).eq("id", id).maybeSingle<Ticket>(),
     db
       .from("ticket_events")
@@ -88,6 +108,17 @@ export async function getTicket(
       .eq("ticket_id", id)
       .order("id", { ascending: true })
       .returns<TicketEvent[]>(),
+    // Ordered by id so the panel lists rules in a stable order across renders.
+    db.from("policies").select("*").order("id").returns<Policy[]>(),
+    // Settled tickets only, which is also all the evidence rules will accept. A
+    // demo-scale queue, so the relevance filter runs in code beside the rule that
+    // defines it rather than being restated as SQL.
+    db
+      .from("tickets")
+      .select(TICKET_COLUMNS)
+      .in("status", ["EXECUTED", "REJECTED"])
+      .order("created_at", { ascending: false })
+      .returns<Ticket[]>(),
   ])
 
   if (ticketRes.error) {
@@ -105,8 +136,41 @@ export async function getTicket(
       message: `The audit trail could not be read: ${eventsRes.error.message}. The trail is the record of who authorized what, so this ticket is not shown without it.`,
     }
   }
+  // The evidence reads are not fatal, and deliberately so: an operator can still
+  // decide without the reference panels, and refusing to render the gate because a
+  // supporting query failed would be the worse outcome. An empty panel says the
+  // evidence could not be read rather than implying there was none.
+  if (policiesRes.error || candidatesRes.error) {
+    return {
+      ok: true,
+      data: {
+        ticket: ticketRes.data,
+        events: eventsRes.data,
+        policies: [],
+        related: [],
+      },
+    }
+  }
 
-  return { ok: true, data: { ticket: ticketRes.data, events: eventsRes.data } }
+  const ticket = ticketRes.data
+  const category = ticket.analysis?.category
+  return {
+    ok: true,
+    data: {
+      ticket,
+      events: eventsRes.data,
+      policies: applicablePolicies(policiesRes.data, {
+        category,
+        actionType: ticket.draft?.proposedAction.type,
+      }),
+      related: relatedTickets(candidatesRes.data, {
+        id: ticket.id,
+        created_at: ticket.created_at,
+        customer_name: ticket.customer_name,
+        category,
+      }),
+    },
+  }
 }
 
 // ---------------------------------------------------------------- write path

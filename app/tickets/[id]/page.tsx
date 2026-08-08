@@ -2,7 +2,10 @@ import Link from "next/link"
 import {
   ArrowLeft,
   Bot,
+  BookText,
+  Cog,
   Gavel,
+  History,
   Lock,
   Quote,
   TriangleAlert,
@@ -32,7 +35,13 @@ import {
   tierLabel,
 } from "@/lib/format"
 import { verifiedEvidence } from "@/lib/types"
-import type { Ticket, TicketEvent } from "@/lib/types"
+import type {
+  Actor,
+  Policy,
+  PriorTicket,
+  Ticket,
+  TicketEvent,
+} from "@/lib/types"
 import { cn } from "@/lib/utils"
 
 // The decision detail. Section order is fixed by CLAUDE.md §6 and does not
@@ -248,6 +257,137 @@ function RiskFactors({ ticket }: { ticket: Ticket }) {
   )
 }
 
+/**
+ * Settled earlier tickets that bear on this one, with the stated reason each was
+ * retrieved.
+ *
+ * Retrieved by exact match on customer and category (lib/evidence.ts), so the
+ * basis is a rule an operator can check rather than a similarity score they
+ * cannot. The reason is shown on every row for that reason: prior context whose
+ * relevance is unexplained is just an adjacent claim.
+ */
+function RelatedTickets({ related }: { related: PriorTicket[] }) {
+  if (related.length === 0) {
+    return (
+      <p className="text-[13px] text-muted-foreground">
+        No settled earlier ticket matches this customer or this category, so none
+        is shown.
+      </p>
+    )
+  }
+  return (
+    <ul className="divide-y overflow-hidden rounded-md border bg-card">
+      {related.map((prior) => (
+        <li key={prior.id} className="px-3.5 py-2.5">
+          <div className="flex flex-wrap items-baseline gap-x-2.5 gap-y-1.5">
+            <Link
+              href={`/tickets/${prior.id}`}
+              className="focus-ring min-w-0 flex-1 text-[13px] font-medium tracking-tight underline-offset-4 hover:underline"
+            >
+              {prior.subject}
+            </Link>
+            <Badge
+              variant="outline"
+              className="rounded-sm border-border/80 px-1.5 text-[11px] font-normal text-muted-foreground"
+            >
+              {prior.relation}
+            </Badge>
+            <span className="shrink-0 font-mono text-[11px] text-muted-foreground tabular-nums">
+              {formatTimestamp(prior.created_at)}
+            </span>
+          </div>
+          {/* What actually happened to it. The outcome is the useful part of a
+              prior ticket — the decision someone already took on a case like
+              this one. */}
+          <div className="mt-1.5 flex flex-wrap items-center gap-x-2.5 gap-y-1.5 text-xs text-muted-foreground">
+            <StatusBadge status={prior.status} />
+            {prior.outcome ? (
+              <span>{actionLabel(prior.outcome)}</span>
+            ) : (
+              <span>No action was carried out</span>
+            )}
+            {prior.risk ? <RiskBadge risk={prior.risk} /> : null}
+          </div>
+        </li>
+      ))}
+    </ul>
+  )
+}
+
+/**
+ * The operational rules that apply to this ticket, each with the reference an
+ * operator can go and read.
+ *
+ * These are retrieved from our own reference data by exact match on category and
+ * proposed action — never written by a model. A model-authored policy is an
+ * invented policy, which is the failure the verifier exists to catch, so the
+ * rules the decision is judged against do not come from one.
+ */
+function PolicyEvidence({ policies }: { policies: Policy[] }) {
+  if (policies.length === 0) {
+    return (
+      <p className="text-[13px] text-muted-foreground">
+        No operational rule is keyed to this category or proposed action.
+      </p>
+    )
+  }
+  return (
+    <ul className="space-y-2">
+      {policies.map((policy) => (
+        <li key={policy.id} className="rounded-md border bg-card px-3.5 py-3">
+          <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+            <p className="text-[13px] font-medium tracking-tight">
+              {policy.title}
+            </p>
+            <cite className="font-mono text-[11px] text-muted-foreground not-italic">
+              {policy.source_ref}
+            </cite>
+          </div>
+          <p className="mt-1.5 text-[13px] leading-relaxed text-muted-foreground">
+            {policy.body}
+          </p>
+        </li>
+      ))}
+    </ul>
+  )
+}
+
+/**
+ * The three actors, as three visibly different things.
+ *
+ * The distinction is the product: `ai` inferred something, `system` did something
+ * mechanical that involved no judgment, `human` authorized something. Only the
+ * last of those can move a ticket past the gate, so it is the only one that gets
+ * full-contrast treatment in the trail.
+ *
+ * The label is real text rather than a CSS transform of the enum, so it survives
+ * being read aloud and does not silently become "AWAITING_APPROVAL"-style raw
+ * vocabulary if the enum ever grows.
+ */
+const ACTOR_META: Record<
+  Actor,
+  { label: string; icon: typeof Bot; marker: string; text: string }
+> = {
+  ai: {
+    label: "AI",
+    icon: Bot,
+    marker: "border-border bg-muted text-muted-foreground",
+    text: "text-muted-foreground",
+  },
+  system: {
+    label: "System",
+    icon: Cog,
+    marker: "border-border bg-muted text-muted-foreground",
+    text: "text-muted-foreground",
+  },
+  human: {
+    label: "Human",
+    icon: User,
+    marker: "border-foreground/25 bg-card text-foreground",
+    text: "font-medium text-foreground",
+  },
+}
+
 function AuditTrail({ events }: { events: TicketEvent[] }) {
   if (events.length === 0) {
     return <NotYet>No transitions yet. The first will be recorded here.</NotYet>
@@ -261,8 +401,8 @@ function AuditTrail({ events }: { events: TicketEvent[] }) {
         className="absolute top-3 bottom-3 left-[0.6875rem] w-px bg-border"
       />
       {events.map((event) => {
-        const isHuman = event.actor === "human"
-        const Icon = isHuman ? User : Bot
+        const actor = ACTOR_META[event.actor]
+        const Icon = actor.icon
         return (
           <li
             key={event.id}
@@ -272,9 +412,7 @@ function AuditTrail({ events }: { events: TicketEvent[] }) {
               aria-hidden="true"
               className={cn(
                 "relative z-10 mt-0.5 flex size-5.5 shrink-0 items-center justify-center rounded-full border",
-                isHuman
-                  ? "border-foreground/25 bg-card text-foreground"
-                  : "border-border bg-muted text-muted-foreground"
+                actor.marker
               )}
             >
               <Icon className="size-3" />
@@ -284,13 +422,11 @@ function AuditTrail({ events }: { events: TicketEvent[] }) {
                 <span
                   className={cn(
                     "font-mono text-[11px] tracking-wide uppercase",
-                    isHuman
-                      ? "font-medium text-foreground"
-                      : "text-muted-foreground"
+                    actor.text
                   )}
                 >
                   <span className="sr-only">Actor: </span>
-                  {event.actor}
+                  {actor.label}
                 </span>
                 <span className="text-[13px]">
                   {event.from_status ? (
@@ -355,7 +491,7 @@ export default async function TicketPage(props: PageProps<"/tickets/[id]">) {
     )
   }
 
-  const { ticket, events } = result.data
+  const { ticket, events, policies, related } = result.data
   const { analysis, draft, verification } = ticket
   const evidence = analysis ? verifiedEvidence(analysis.evidence, ticket.body) : []
   const atGate = ticket.status === "AWAITING_APPROVAL"
@@ -525,6 +661,34 @@ export default async function TicketPage(props: PageProps<"/tickets/[id]">) {
           ) : (
             <NotYet>This ticket has not been analyzed.</NotYet>
           )}
+
+          {/* Retrieved evidence, outside the analysis conditional on purpose: a
+              ticket with no analysis still has a customer history and is still
+              subject to the general rules, and both are worth seeing before the
+              pipeline has run. */}
+          <div className="space-y-2">
+            <p className="label-xs flex items-center gap-1.5">
+              <History aria-hidden="true" className="size-3.5" />
+              Previous tickets
+            </p>
+            <RelatedTickets related={related} />
+            <p className="text-xs text-muted-foreground">
+              Settled tickets that share this customer or this category, matched
+              on those fields and ordered by recency. Not a similarity score.
+            </p>
+          </div>
+
+          <div className="space-y-2">
+            <p className="label-xs flex items-center gap-1.5">
+              <BookText aria-hidden="true" className="size-3.5" />
+              Operational rules that apply
+            </p>
+            <PolicyEvidence policies={policies} />
+            <p className="text-xs text-muted-foreground">
+              Reference text from our own records, selected by category and
+              proposed action. Not written by a model.
+            </p>
+          </div>
         </div>
       </Section>
 
