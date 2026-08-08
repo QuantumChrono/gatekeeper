@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from "vitest"
 import { z } from "zod"
 
-import { runStage } from "../lib/ai/provider"
+import {
+  FALLBACK_MODEL as FALLBACK,
+  PRIMARY_MODEL as PRIMARY,
+  runStage,
+} from "../lib/ai/provider"
 
 // The tier ladder itself: primary model → fallback model → seeded result, and the
 // honesty rules that hang off it. Tested here, once, rather than three times
@@ -17,9 +21,9 @@ import { runStage } from "../lib/ai/provider"
 const Schema = z.object({ verdict: z.string().min(1) })
 const VALID = { verdict: "ok" }
 
-/** Whatever the module resolved from env; the assertions only need them distinct. */
-const PRIMARY = "anthropic/claude-opus-5"
-const FALLBACK = "openai/gpt-5.1"
+// Imported rather than restated: these are whatever the module resolved from
+// env, and the assertions only need them distinct. Hardcoding them here is what
+// let the suite keep passing against models the defaults had moved off.
 
 const stage = (args: Partial<Parameters<typeof runStage>[0]> = {}) =>
   runStage({

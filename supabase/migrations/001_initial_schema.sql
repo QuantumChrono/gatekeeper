@@ -444,7 +444,7 @@ begin
     insert into ticket_events (ticket_id, created_at, actor, from_status, to_status, reason, source, model)
     values (
       p_id, v_at,
-      case when v_human then 'human' else 'ai' end,
+      case when v_human then 'human'::actor_kind else 'ai'::actor_kind end,
       v_from, v_next,
       case
         when v_next = 'ANALYZING'          then 'Classifying category and severity, extracting evidence.'

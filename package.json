@@ -12,6 +12,7 @@
     "test:e2e": "playwright test"
   },
   "dependencies": {
+    "@ai-sdk/google": "^4.0.37",
     "@base-ui/react": "^1.7.0",
     "@supabase/supabase-js": "^2.112.2",
     "ai": "^7.0.55",
