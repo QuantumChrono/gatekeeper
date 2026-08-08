@@ -189,7 +189,10 @@ function Gate({
           ) : (
             <Button type="submit" disabled={busy}>
               <CircleCheck aria-hidden="true" />
-              {approving ? "Recording…" : "Approve"}
+              {/* Named for what it does: this records the approval and then
+                  carries the action out. "Approve" alone would understate the
+                  side effect the operator is authorizing. */}
+              {approving ? "Recording…" : "Approve and execute"}
             </Button>
           )}
         </form>

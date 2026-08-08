@@ -105,7 +105,8 @@ function Unset({ children }: { children: string }) {
 }
 
 function Header({ ticket }: { ticket: Ticket }) {
-  const confidence = ticket.verification?.confidence ?? ticket.analysis?.confidence
+  const { analysis } = ticket
+  const confidence = ticket.verification?.confidence ?? analysis?.confidence
   return (
     <header className="space-y-5">
       <Link
@@ -148,6 +149,26 @@ function Header({ ticket }: { ticket: Ticket }) {
           </span>
         </div>
       </div>
+
+      {/* The AI's one-sentence reading, and the sentence that says what this
+          screen is. Above the instruments because an operator should know who
+          produced what before they read a single number (CLAUDE.md §1). */}
+      {analysis ? (
+        <div className="space-y-2">
+          <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+            <p className="label-xs">AI decision summary</p>
+            <ProvenanceBadge source={analysis.source} model={analysis.model} />
+          </div>
+          <p className="text-sm leading-relaxed">{analysis.summary}</p>
+          <p className="flex items-start gap-2.5 text-xs leading-relaxed text-muted-foreground">
+            <Bot aria-hidden="true" className="mt-0.5 size-3.5 shrink-0" />
+            <span>
+              AI prepared this decision. A human authorizes the action. Nothing
+              below has happened yet.
+            </span>
+          </p>
+        </div>
+      ) : null}
 
       {/* The instrument strip: the four values that decide whether this needs a
           human, on one surface, in fixed positions. */}
@@ -418,7 +439,7 @@ export default async function TicketPage(props: PageProps<"/tickets/[id]">) {
 
       {/* 3 — the source, and what the classification rests on */}
       <Section
-        title="Evidence and reasoning"
+        title="Evidence and decision factors"
         step="03"
         provenance={
           analysis ? (
@@ -483,10 +504,12 @@ export default async function TicketPage(props: PageProps<"/tickets/[id]">) {
               </div>
 
               <div className="space-y-1.5">
-                <p className="label-xs">Reasoning</p>
+                <p className="label-xs">Decision factors</p>
                 {/* One claim per line: the schema asks the analyzer for separate
                     claims, so running them together as prose would discard the
-                    structure it was told to produce. */}
+                    structure it was told to produce. Findings, not deliberation
+                    — the prompt asks for what drove the classification, and no
+                    train of thought is shown here. */}
                 <ul className="space-y-1.5">
                   {analysis.reasoning.map((claim) => (
                     <li
