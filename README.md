@@ -1,36 +1,46 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Gatekeeper
 
-## Getting Started
+AI prepares the decision. A human authorizes the action.
 
-First, run the development server:
+One-line pitch: Gatekeeper analyzes incoming operational tickets with an AI pipeline (analyze → draft → verify), defends against prompt-injection and policy conflicts, and surfaces a concise human approval gate with an append-only audit trail.
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+Live demo: https://usegatekeeper.vercel.app
+
+Customer portal: https://usegatekeeper.vercel.app/portal
+
+**Key features**
+- Multi-stage AI pipeline: `analyze`, `draft`, `verify`.
+- Human Approval Gate: decisions are executed only after a recorded human approval.
+- Prompt Injection Defense: verifier detects prompt injection and policy conflicts and marks the ticket visibly.
+- Audit History: append-only trail with actor, timestamps, and provenance for every transition.
+
+**Architecture (state machine)**
+
+```mermaid
+stateDiagram-v2
+	RECEIVED --> ANALYZING
+	ANALYZING --> DRAFTED
+	DRAFTED --> VERIFIED
+	VERIFIED --> AWAITING_APPROVAL
+	AWAITING_APPROVAL --> APPROVED
+	AWAITING_APPROVAL --> REJECTED
+	APPROVED --> EXECUTED
+	REJECTED --> STOP
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+**Tech stack**
+- Next.js 16 (App Router) + TypeScript
+- Tailwind CSS + shadcn/ui + Base UI primitives
+- Supabase Postgres (schema in `supabase/migrations`)
+- Vercel AI SDK and Google Generative AI (Gemini) for model calls
+- Vitest + Playwright for tests
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+See `BUILDSTEPS.md` for detailed local setup and run instructions.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Contributing & testing
+- Install: `pnpm install`
+- Run dev: `pnpm dev`
+- Build: `pnpm build`
+- Tests: `pnpm test` (unit), `pnpm test:e2e` (e2e)
 
-## Learn More
-
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+If you are evaluating this project as a judge, follow `BUILDSTEPS.md` for exact steps, environment variables, and a migration example.

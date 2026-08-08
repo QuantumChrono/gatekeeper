@@ -9,6 +9,7 @@ import {
   Lock,
   Quote,
   TriangleAlert,
+  ShieldCheck,
   User,
 } from "lucide-react"
 
@@ -328,7 +329,7 @@ function RelatedTickets({ related }: { related: PriorTicket[] }) {
  * invented policy, which is the failure the verifier exists to catch, so the
  * rules the decision is judged against do not come from one.
  */
-function PolicyEvidence({ policies }: { policies: Policy[] }) {
+function PolicyEvidence({ policies, highlightPolicy }: { policies: Policy[]; highlightPolicy?: boolean }) {
   if (policies.length === 0) {
     return (
       <p className="text-[13px] text-muted-foreground">
@@ -339,7 +340,15 @@ function PolicyEvidence({ policies }: { policies: Policy[] }) {
   return (
     <ul className="space-y-2">
       {policies.map((policy) => (
-        <li key={policy.id} className="rounded-md border bg-card px-3.5 py-3">
+        <li
+          key={policy.id}
+          className={cn(
+            "rounded-md border px-3.5 py-3",
+            highlightPolicy
+              ? "border-danger/30 bg-danger/[0.04] dark:bg-danger/[0.06]"
+              : "bg-card"
+          )}
+        >
           <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
             <p className="text-[13px] font-medium tracking-tight">
               {policy.title}
@@ -505,6 +514,16 @@ export default async function TicketPage(props: PageProps<"/tickets/[id]">) {
   const evidence = analysis ? verifiedEvidence(analysis.evidence, ticket.body) : []
   const atGate = ticket.status === "AWAITING_APPROVAL"
   const blocked = verification ? !verification.safeToSend : false
+  const hasVerificationIssues = verification ? verification.issues.length > 0 : false
+  const hasInjection = verification?.issues.some((i) => /inject|injection/i.test(i)) ?? false
+  const hasPolicyConflict = verification?.issues.some((i) => /policy/i.test(i)) ?? false
+  const securityBadgeLabel = hasInjection
+    ? "INJECTION ATTACK DEFENDED"
+    : hasPolicyConflict
+    ? "POLICY VIOLATION DETECTED"
+    : hasVerificationIssues
+    ? "SECURITY CONCERNS"
+    : null
 
   return (
     // The one surface with an open ticket, so the sidebar trail gets its status
@@ -612,10 +631,16 @@ export default async function TicketPage(props: PageProps<"/tickets/[id]">) {
             <p className="label-xs">Customer message</p>
             {/* Untrusted input, rendered as text. Held on the page background
                 rather than a panel so it reads as the raw source material. */}
-            <div className="rounded-md border border-dashed px-4 py-3.5">
-              <p className="text-sm leading-relaxed whitespace-pre-wrap">
-                {ticket.body}
-              </p>
+            <div
+              className={cn(
+                "rounded-md border border-dashed px-4 py-3.5",
+                hasVerificationIssues &&
+                  (hasInjection
+                    ? "ring-2 ring-warning/40 bg-warning/[0.04] dark:bg-warning/[0.08] border-warning/30"
+                    : "ring-2 ring-danger/40 bg-danger/[0.04] dark:bg-danger/[0.08] border-danger/30")
+              )}
+            >
+              <p className={cn("text-sm leading-relaxed whitespace-pre-wrap", hasVerificationIssues && "text-foreground")}>{ticket.body}</p>
             </div>
           </div>
 
@@ -646,7 +671,14 @@ export default async function TicketPage(props: PageProps<"/tickets/[id]">) {
                     {evidence.map((quote) => (
                       <li
                         key={quote}
-                        className="flex gap-2.5 border-l-2 border-l-border py-0.5 pl-3 text-[13px] leading-relaxed text-muted-foreground"
+                        className={cn(
+                          "flex gap-2.5 border-l-2 py-0.5 pl-3 text-[13px] leading-relaxed",
+                          hasVerificationIssues
+                            ? hasInjection
+                              ? "border-l-warning/60 text-foreground"
+                              : "border-l-danger/60 text-foreground"
+                            : "border-l-border text-muted-foreground"
+                        )}
                       >
                         <Quote
                           aria-hidden="true"
@@ -707,7 +739,7 @@ export default async function TicketPage(props: PageProps<"/tickets/[id]">) {
               <BookText aria-hidden="true" className="size-3.5" />
               Operational rules that apply
             </p>
-            <PolicyEvidence policies={policies} />
+            <PolicyEvidence policies={policies} highlightPolicy={hasPolicyConflict} />
             <p className="text-xs text-muted-foreground">
               Reference text from our own records, selected by category and
               proposed action. Not written by a model.
@@ -814,6 +846,12 @@ export default async function TicketPage(props: PageProps<"/tickets/[id]">) {
             Approval gate
           </h2>
           {ticket.risk ? <RiskBadge risk={ticket.risk} /> : null}
+          {securityBadgeLabel ? (
+            <Badge variant="security" className="ml-3 gap-2.5">
+              <ShieldCheck aria-hidden="true" className="size-3" />
+              {securityBadgeLabel}
+            </Badge>
+          ) : null}
         </div>
 
         <div className="space-y-4 px-5 py-4">
