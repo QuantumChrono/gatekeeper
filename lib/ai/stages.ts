@@ -1,9 +1,13 @@
 import { z } from "zod"
 
 import { runStage, type Generator, type Tiered } from "@/lib/ai/provider"
-import type { Result } from "@/lib/db"
 import { computeRisk } from "@/lib/workflow"
-import { verifiedEvidence, type CustomerTier, type Risk } from "@/lib/types"
+import {
+  verifiedEvidence,
+  type CustomerTier,
+  type Result,
+  type Risk,
+} from "@/lib/types"
 
 // The analyzer: one prompt, one schema. Advisory only — it classifies and
 // recommends, and it executes nothing. Moving the ticket is a human's decision
@@ -435,10 +439,10 @@ export async function draft(args: {
 
   const quotes = verifiedEvidence(evidence ?? analysis.evidence, ticket.body)
 
-  // ponytail: the DRAFTED row shape in lib/types.ts is
-  // { response, action: { type, params }, rationale } — the mapping onto these
-  // field names belongs with the server action that writes it, which is the next
-  // stage of work. Nothing persists a draft yet.
+  // What this returns is what gets stored: `Draft` in lib/types.ts is this
+  // schema plus provenance, so there is no mapping step between the stage and
+  // the column. That is what lets runStage validate a seeded tier-3 payload
+  // against the same schema as model output.
   return runStage({
     schema: buildDraftSchema({ ticket, context }),
     system: DRAFT_SYSTEM,
@@ -807,11 +811,10 @@ export async function verify(args: {
 
   const quotes = verifiedEvidence(evidence ?? analysis.evidence, ticket.body)
 
-  // ponytail: the verification row shape in lib/types.ts is
-  // { issues, confidence, safeToSend, notes } — the mapping onto these field
-  // names, and the two recorded transitions that go with it, belong with the
-  // server action that writes them. Nothing persists a verification yet, and the
-  // state machine is not this change.
+  // Stored as returned: `Verification` in lib/types.ts is this schema plus
+  // provenance and the derived `safeToSend`. runPipeline writes it with the
+  // VERIFIED transition, so the verdict and the status it justifies land
+  // together.
   const result = await runStage({
     schema: buildVerificationSchema({ ticket, draft, context }),
     system: VERIFY_SYSTEM,

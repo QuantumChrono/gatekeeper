@@ -1,7 +1,17 @@
 import { createClient } from "@supabase/supabase-js"
 import { connection } from "next/server"
 
-import type { Ticket, TicketEvent } from "@/lib/types"
+import type { TransitionStore } from "@/lib/workflow"
+import type {
+  Analysis,
+  Draft,
+  Result,
+  Risk,
+  Status,
+  Ticket,
+  TicketEvent,
+  Verification,
+} from "@/lib/types"
 
 // Read path only. The browser holds the anon key and RLS allows select and
 // nothing else (CLAUDE.md §7); every mutation will go through a Server Action
@@ -11,17 +21,23 @@ const url = process.env.NEXT_PUBLIC_SUPABASE_URL
 const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
 
 /**
- * Reads either succeed or explain themselves. Pages render the message, so a
- * missing database says what happened and what to do next instead of throwing a
- * stack trace at an operator (CLAUDE.md §6).
+ * Reads and writes either succeed or explain themselves. Pages render the
+ * message, so a missing database says what happened and what to do next instead
+ * of throwing a stack trace at an operator (CLAUDE.md §6).
+ *
+ * Defined in lib/types.ts so that lib/workflow.ts can use it without importing a
+ * database client; re-exported here because that is where callers already expect
+ * it.
  */
-export type Result<T> = { ok: true; data: T } | { ok: false; message: string }
+export type { Result } from "@/lib/types"
 
 const UNCONFIGURED =
   "No database is configured. Set NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY in .env.local, then apply supabase/migrations/001_initial_schema.sql to seed the demo tickets."
 
+// `seed` is deliberately absent: it is tier-3 input for the AI stages, read
+// server-side by the pipeline, and it has no business in a page payload.
 const TICKET_COLUMNS =
-  "id,created_at,updated_at,subject,body,customer_name,customer_tier,order_value_cents,status,analysis,draft,verification,risk,execution_result"
+  "id,created_at,updated_at,subject,body,customer_name,customer_tier,order_value_cents,status,analysis,draft,verification,risk,execution_result,pipeline_error"
 
 function reader() {
   if (!url || !anonKey) return null
@@ -91,4 +107,140 @@ export async function getTicket(
   }
 
   return { ok: true, data: { ticket: ticketRes.data, events: eventsRes.data } }
+}
+
+// ---------------------------------------------------------------- write path
+// Everything below runs only inside a Server Action. The service-role key is
+// read from a non-NEXT_PUBLIC_* var, so Next has no value to inline into a
+// browser bundle even by accident, and nothing here is reachable from a client
+// component (CLAUDE.md §7).
+
+const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY
+
+const NO_WRITE_KEY =
+  "No write credentials are configured, so nothing was changed. Set SUPABASE_SERVICE_ROLE_KEY in .env.local — it is the server-only key, and it must never be a NEXT_PUBLIC_* variable."
+
+function writer() {
+  if (!url || !serviceKey) return null
+  return createClient(url, serviceKey, { auth: { persistSession: false } })
+}
+
+/**
+ * What the AI stages need to run, including the tier-3 seed.
+ *
+ * Read with the service-role client rather than the anon one so the seed stays
+ * on the server: it is stage input, and no page renders it.
+ */
+export type PipelineTicket = {
+  id: string
+  subject: string
+  body: string
+  customer_tier: Ticket["customer_tier"]
+  order_value_cents: number
+  status: Status
+  /** Re-read so the high-risk confirmation step is checked against the row. */
+  risk: Risk | null
+  analysis: Analysis | null
+  draft: Draft | null
+  verification: Verification | null
+  seed: {
+    analysis?: unknown
+    draft?: unknown
+    verification?: unknown
+  } | null
+}
+
+export async function getPipelineTicket(
+  id: string
+): Promise<Result<PipelineTicket>> {
+  const db = writer()
+  if (!db) return { ok: false, message: NO_WRITE_KEY }
+
+  const { data, error } = await db
+    .from("tickets")
+    .select(
+      "id,subject,body,customer_tier,order_value_cents,status,risk,analysis,draft,verification,seed"
+    )
+    .eq("id", id)
+    .maybeSingle<PipelineTicket>()
+
+  if (error) {
+    return { ok: false, message: `This ticket could not be read: ${error.message}.` }
+  }
+  if (!data) return { ok: false, message: "No ticket exists with this id." }
+  return { ok: true, data }
+}
+
+/**
+ * The one implementation of the state machine's write port.
+ *
+ * It holds no policy: `canTransition` in lib/workflow.ts decides what may move
+ * where, and `transition()` re-reads and checks before calling `apply`. What this
+ * adds is the trip to a database that performs the compare-and-set and the audit
+ * insert in a single statement pair, inside one transaction.
+ */
+export const store: TransitionStore = {
+  async readStatus(ticketId) {
+    const db = writer()
+    if (!db) return { ok: false, message: NO_WRITE_KEY }
+
+    const { data, error } = await db
+      .from("tickets")
+      .select("status")
+      .eq("id", ticketId)
+      .maybeSingle<{ status: Status }>()
+
+    if (error) {
+      return {
+        ok: false,
+        message: `The ticket's current status could not be read, so nothing was changed: ${error.message}.`,
+      }
+    }
+    return { ok: true, data: data?.status ?? null }
+  },
+
+  async apply({ ticketId, expect, to, actor, reason, source, model, patch }) {
+    const db = writer()
+    if (!db) return { ok: false, message: NO_WRITE_KEY }
+
+    // A postgres function, so the conditional update and the audit event share
+    // one transaction. Two round trips could leave a moved ticket with no record
+    // of who moved it, and the trail is the product's evidence (CLAUDE.md §7).
+    const { data, error } = await db.rpc("apply_transition", {
+      p_id: ticketId,
+      p_expect: expect,
+      p_to: to,
+      p_actor: actor,
+      p_reason: reason,
+      p_source: source ?? null,
+      p_model: model ?? null,
+      p_patch: patch ?? {},
+    })
+
+    if (error) {
+      return {
+        ok: false,
+        message: `The change was rejected by the database and nothing was written: ${error.message}.`,
+      }
+    }
+    return { ok: true, data: { applied: data === true } }
+  },
+
+  async recordFailure({ ticketId, error }) {
+    const db = writer()
+    if (!db) return { ok: false, message: NO_WRITE_KEY }
+
+    const { error: rpcError } = await db.rpc("record_pipeline_failure", {
+      p_id: ticketId,
+      p_error: error,
+    })
+
+    if (rpcError) {
+      return {
+        ok: false,
+        message: `The stage failed, and the failure itself could not be recorded: ${rpcError.message}.`,
+      }
+    }
+    return { ok: true, data: undefined }
+  },
 }

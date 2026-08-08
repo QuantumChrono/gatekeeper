@@ -20,9 +20,9 @@ import {
   WorkflowProgress,
   statusLabel,
 } from "@/components/badges"
+import { DecisionControls } from "@/components/decision-controls"
 import { Notice } from "@/components/notice"
 import { Badge } from "@/components/ui/badge"
-import { Button } from "@/components/ui/button"
 import { getTicket } from "@/lib/db"
 import {
   actionLabel,
@@ -198,7 +198,9 @@ function RiskFactors({ ticket }: { ticket: Ticket }) {
     { label: "Severity", value: ticket.analysis?.severity ?? "unknown" },
     {
       label: "Action",
-      value: ticket.draft ? actionLabel(ticket.draft.action.type) : "none",
+      value: ticket.draft
+        ? actionLabel(ticket.draft.proposedAction.type)
+        : "none",
     },
     { label: "Customer tier", value: tierLabel(ticket.customer_tier) },
     {
@@ -362,14 +364,17 @@ export default async function TicketPage(props: PageProps<"/tickets/[id]">) {
                   variant="outline"
                   className="rounded-sm border-border/80 px-1.5 font-mono text-[11px] tracking-wide"
                 >
-                  {draft.action.type}
+                  {draft.proposedAction.type}
                 </Badge>
                 <p className="min-w-0 flex-1 text-[15px] leading-snug font-medium tracking-tight text-balance">
-                  {actionSentence(draft.action.type, draft.action.params)}
+                  {actionSentence(
+                    draft.proposedAction.type,
+                    draft.proposedAction.params
+                  )}
                 </p>
               </div>
               <p className="mt-2.5 border-t pt-2.5 text-[13px] leading-relaxed text-muted-foreground">
-                {draft.rationale}
+                {draft.proposedAction.rationale}
               </p>
             </div>
             <RiskFactors ticket={ticket} />
@@ -399,7 +404,7 @@ export default async function TicketPage(props: PageProps<"/tickets/[id]">) {
             <blockquote className="rounded-md rounded-l-none border border-l-2 border-l-foreground/25 bg-muted/30 px-4 py-3.5">
               {/* Plain text, never HTML — the draft quotes untrusted ticket content. */}
               <p className="text-sm leading-relaxed whitespace-pre-wrap">
-                {draft.response}
+                {draft.proposedResponse}
               </p>
             </blockquote>
             <figcaption className="text-xs text-muted-foreground">
@@ -479,9 +484,19 @@ export default async function TicketPage(props: PageProps<"/tickets/[id]">) {
 
               <div className="space-y-1.5">
                 <p className="label-xs">Reasoning</p>
-                <p className="text-[13px] leading-relaxed text-muted-foreground">
-                  {analysis.reasoning}
-                </p>
+                {/* One claim per line: the schema asks the analyzer for separate
+                    claims, so running them together as prose would discard the
+                    structure it was told to produce. */}
+                <ul className="space-y-1.5">
+                  {analysis.reasoning.map((claim) => (
+                    <li
+                      key={claim}
+                      className="text-[13px] leading-relaxed text-muted-foreground before:mr-2 before:text-muted-foreground/60 before:content-['—']"
+                    >
+                      {claim}
+                    </li>
+                  ))}
+                </ul>
               </div>
             </>
           ) : (
@@ -547,7 +562,7 @@ export default async function TicketPage(props: PageProps<"/tickets/[id]">) {
             )}
 
             <p className="border-t pt-3 text-[13px] leading-relaxed text-muted-foreground">
-              {verification.notes}
+              {verification.verificationSummary}
             </p>
           </div>
         ) : (
@@ -591,7 +606,6 @@ export default async function TicketPage(props: PageProps<"/tickets/[id]">) {
 
         <div className="space-y-4 px-5 py-4">
           <p
-            aria-live="polite"
             className={cn(
               "text-[13px] leading-relaxed",
               atGate ? "text-foreground" : "text-muted-foreground"
@@ -599,32 +613,56 @@ export default async function TicketPage(props: PageProps<"/tickets/[id]">) {
           >
             {atGate
               ? "Nothing has happened yet. Everything above is a recommendation until it is approved here."
-              : `This ticket is not awaiting a decision. The gate accepts a decision only at ${statusLabel(
+              : `The gate accepts a decision only at ${statusLabel(
                   "AWAITING_APPROVAL"
-                )}, and the server re-checks that on every write.`}
+                )}, and the server re-reads this ticket's status and re-checks the transition on every write.`}
           </p>
 
-          <div className="flex flex-wrap items-center gap-2">
-            <Button disabled aria-describedby="gate-pending">
-              Approve
-            </Button>
-            <Button variant="outline" disabled aria-describedby="gate-pending">
-              Reject
-            </Button>
-          </div>
+          {/* A stage that failed. Stated here rather than inferred from a missing
+              section, and it does not pretend the workflow moved on. */}
+          {ticket.pipeline_error ? (
+            <div
+              role="alert"
+              className="space-y-1.5 rounded-sm border border-danger/25 bg-danger/[0.04] px-3.5 py-3"
+            >
+              <p className="flex items-center gap-2 text-[13px] font-medium tracking-tight">
+                <TriangleAlert
+                  aria-hidden="true"
+                  className="size-3.5 shrink-0 text-danger"
+                />
+                The {ticket.pipeline_error.stage} stage failed
+              </p>
+              <p className="text-[13px] leading-relaxed text-muted-foreground">
+                {ticket.pipeline_error.message}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                The ticket was left at {statusLabel(ticket.status)} and nothing
+                was carried out. Running the stages again retries from there.
+              </p>
+            </div>
+          ) : null}
 
-          {/* Honest about being unbuilt: disabled, and it says why. A live-looking
-              button that writes nothing would make the gate a lie. */}
-          <p
-            id="gate-pending"
-            className="flex items-start gap-2.5 border-t pt-3.5 text-xs leading-relaxed text-muted-foreground"
-          >
+          <DecisionControls
+            id={ticket.id}
+            status={ticket.status}
+            risk={ticket.risk}
+            actionSentence={
+              draft
+                ? actionSentence(
+                    draft.proposedAction.type,
+                    draft.proposedAction.params
+                  )
+                : "No action has been proposed."
+            }
+          />
+
+          <p className="flex items-start gap-2.5 border-t pt-3.5 text-xs leading-relaxed text-muted-foreground">
             <Lock aria-hidden="true" className="mt-0.5 size-3.5 shrink-0" />
             <span>
-              Not yet wired. Approving and rejecting land with the Server Actions
-              that re-read status from the database and record the decision, so
-              these controls stay disabled until a decision can actually be
-              written.
+              Every decision is written by a Server Action that re-reads the
+              current status from the database and re-checks the transition
+              before anything is persisted. Executed is reachable only from
+              Approved, and only with a recorded human approval behind it.
             </span>
           </p>
         </div>

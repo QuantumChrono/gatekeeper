@@ -1,8 +1,7 @@
 import { createGateway, generateObject } from "ai"
 import type { ZodType } from "zod"
 
-import type { Result } from "@/lib/db"
-import type { AiSource } from "@/lib/types"
+import type { AiSource, Result } from "@/lib/types"
 
 // Server-only by construction: reached from Server Components and Server
 // Actions, never imported into a client component. The key is read from a
