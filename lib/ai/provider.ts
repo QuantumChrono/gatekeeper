@@ -15,8 +15,20 @@ import type { AiSource, Result } from "@/lib/types"
 // One provider config and one tiered runner. The three roles (analyze / draft /
 // verify) are prompts and schemas over this — not three clients.
 
-/** Which tier produced a result, and what it cost to say so. */
-export type Tiered<T> = T & { source: AiSource; model?: string }
+/**
+ * Which tier produced a result, and what it cost to say so.
+ *
+ * `degraded` is set when an earlier tier was tried and did not produce a usable
+ * result, on a call that nonetheless succeeded further down the ladder. A
+ * provider outage that the seed absorbed is still an outage, and one the operator
+ * is entitled to know about — without it, a survived failure is indistinguishable
+ * from a clean run (CLAUDE.md §1). Absent when the first tier answered.
+ */
+export type Tiered<T> = T & {
+  source: AiSource
+  model?: string
+  degraded?: string
+}
 
 /**
  * Model resolution lives in env vars so the model changes without touching
@@ -115,7 +127,19 @@ export async function runStage<T extends object>(args: {
         failures.push(`${source} (${modelId}): output failed validation`)
         continue
       }
-      return { ok: true, data: { ...parsed.data, source, model: modelId } }
+      return {
+        ok: true,
+        data: {
+          ...parsed.data,
+          source,
+          model: modelId,
+          // A tier that answered after an earlier one failed is still a degraded
+          // run, and saying so is the difference between a survived outage and a
+          // clean one. These are the sanitized strings collected above — never
+          // raw provider text, which can echo the request (CLAUDE.md §7).
+          ...(failures.length ? { degraded: failures.join("; ") } : {}),
+        },
+      }
     } catch {
       // The reason is deliberately not interpolated: provider errors can echo
       // request contents, and secrets never reach a log (CLAUDE.md §7).
@@ -125,7 +149,13 @@ export async function runStage<T extends object>(args: {
 
   const seeded = schema.safeParse(seed)
   if (seeded.success) {
-    return { ok: true, data: { ...seeded.data, source: "seed" } }
+    // Reaching here means both model tiers were tried, so there is always
+    // something to report. A seeded result that did not say why it was seeded
+    // would read as a configuration choice rather than an outage.
+    return {
+      ok: true,
+      data: { ...seeded.data, source: "seed", degraded: failures.join("; ") },
+    }
   }
 
   return {

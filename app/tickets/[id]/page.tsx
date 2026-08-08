@@ -166,7 +166,11 @@ function Header({ ticket }: { ticket: Ticket }) {
         <div className="space-y-2">
           <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
             <p className="label-xs">AI decision summary</p>
-            <ProvenanceBadge source={analysis.source} model={analysis.model} />
+            <ProvenanceBadge
+              source={analysis.source}
+              model={analysis.model}
+              degraded={analysis.degraded}
+            />
           </div>
           <p className="text-sm leading-relaxed">{analysis.summary}</p>
           <p className="flex items-start gap-2.5 text-xs leading-relaxed text-muted-foreground">
@@ -507,7 +511,11 @@ export default async function TicketPage(props: PageProps<"/tickets/[id]">) {
         step="01"
         provenance={
           draft ? (
-            <ProvenanceBadge source={draft.source} model={draft.model} />
+            <ProvenanceBadge
+              source={draft.source}
+              model={draft.model}
+              degraded={draft.degraded}
+            />
           ) : undefined
         }
       >
@@ -549,7 +557,11 @@ export default async function TicketPage(props: PageProps<"/tickets/[id]">) {
         step="02"
         provenance={
           draft ? (
-            <ProvenanceBadge source={draft.source} model={draft.model} />
+            <ProvenanceBadge
+              source={draft.source}
+              model={draft.model}
+              degraded={draft.degraded}
+            />
           ) : undefined
         }
       >
@@ -579,7 +591,11 @@ export default async function TicketPage(props: PageProps<"/tickets/[id]">) {
         step="03"
         provenance={
           analysis ? (
-            <ProvenanceBadge source={analysis.source} model={analysis.model} />
+            <ProvenanceBadge
+              source={analysis.source}
+              model={analysis.model}
+              degraded={analysis.degraded}
+            />
           ) : undefined
         }
       >
@@ -701,6 +717,7 @@ export default async function TicketPage(props: PageProps<"/tickets/[id]">) {
             <ProvenanceBadge
               source={verification.source}
               model={verification.model}
+              degraded={verification.degraded}
             />
           ) : undefined
         }

@@ -282,14 +282,25 @@ const SOURCE_META: Record<
 export function ProvenanceBadge({
   source,
   model,
+  degraded,
 }: {
   source: AiSource
   model?: string
+  /**
+   * Why a lower tier answered, when one did. The tier label beside it is the
+   * visible signal; this is the reason behind it.
+   *
+   * ponytail: the reason rides in the tooltip, which a keyboard user cannot
+   * reach. The label carries the fact that the run was degraded, so nothing is
+   * conveyed by the tooltip alone — upgrade to the `tooltip` primitive already in
+   * components/ui if the reason itself needs to be reachable.
+   */
+  degraded?: string
 }) {
   const meta = SOURCE_META[source]
   return (
     <span
-      title={meta.title}
+      title={degraded ? `${meta.title} ${degraded}.` : meta.title}
       className="inline-flex items-center gap-1.5 whitespace-nowrap"
     >
       <Badge

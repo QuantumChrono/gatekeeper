@@ -49,7 +49,16 @@ export type Actor = "ai" | "human" | "system"
  * What every stored AI artifact carries: which tier produced it, and which model
  * if one did. Displayed next to the output it belongs to (CLAUDE.md §6).
  */
-type Provenance = { source: AiSource; model?: string }
+type Provenance = {
+  source: AiSource
+  model?: string
+  /**
+   * Set when a tier above this one was tried and failed. Stored with the artifact
+   * so a provider outage the seed absorbed stays on the record and on the screen
+   * instead of vanishing behind a result that happened to work.
+   */
+  degraded?: string
+}
 
 // The three stored artifacts are the three stage schemas plus provenance —
 // derived from them, not restated.
