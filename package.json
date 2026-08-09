@@ -9,9 +9,9 @@
     "lint": "eslint",
     "typecheck": "next typegen && tsc --noEmit",
     "test": "vitest run",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "prepare": "husky"
   },
-  "prepare": "husky install",
   "dependencies": {
     "@ai-sdk/google": "^4.0.37",
     "@base-ui/react": "^1.7.0",
