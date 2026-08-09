@@ -175,6 +175,80 @@ export async function getTicket(id: string): Promise<
   }
 }
 
+/**
+ * What a customer may see of their own ticket, looked up by reference.
+ *
+ * Narrower than `getTicket` on purpose. No audit trail, no policies, no other
+ * tickets, and no analysis or verification: those are the machinery of a decision
+ * an operator takes, and the portal is not the console.
+ *
+ * `draft` is typed down to the one field the customer surface may render. The
+ * action and its rationale are internal — they name teams, systems and doubts the
+ * reply does not — so narrowing the type here makes rendering them a type error
+ * rather than a review comment.
+ */
+export type CustomerTicket = Pick<
+  Ticket,
+  "id" | "created_at" | "subject" | "body" | "status" | "execution_result"
+> & {
+  draft: Pick<Draft, "proposedResponse"> | null
+  follow_ups: FollowUp[]
+}
+
+/**
+ * Read one ticket for the customer who opened it.
+ *
+ * The reference stands in for a session, exactly as it already does for a
+ * follow-up: an unguessable id, listed nowhere a customer can reach. This adds no
+ * access the follow-up endpoint did not already have — it reads what that endpoint
+ * writes to.
+ *
+ * Read with the anon client, which RLS allows select and nothing else, so the
+ * customer surface has no write path even by accident.
+ */
+export async function getCustomerTicket(
+  reference: string
+): Promise<Result<CustomerTicket>> {
+  await connection()
+  const db = reader()
+  if (!db) return { ok: false, message: UNCONFIGURED }
+
+  // Checked as a reference before it reaches a query, so a mistyped one comes
+  // back as a sentence a customer can act on rather than a postgres cast error.
+  if (
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      reference
+    )
+  ) {
+    return {
+      ok: false,
+      message:
+        "That does not look like one of our references. Check it against the confirmation we gave you when you submitted the request.",
+    }
+  }
+
+  const { data, error } = await db
+    .from("tickets")
+    .select("id,created_at,subject,body,status,execution_result,draft,follow_ups")
+    .eq("id", reference)
+    .maybeSingle<CustomerTicket>()
+
+  if (error) {
+    return {
+      ok: false,
+      message: `Your request could not be loaded: ${error.message}. Try again in a moment.`,
+    }
+  }
+  if (!data) {
+    return {
+      ok: false,
+      message:
+        "We have no request with that reference. Check the reference from your confirmation, or submit a new request below.",
+    }
+  }
+  return { ok: true, data }
+}
+
 // ---------------------------------------------------------------- write path
 // Everything below runs only inside a Server Action. The service-role key is
 // read from a non-NEXT_PUBLIC_* var, so Next has no value to inline into a
