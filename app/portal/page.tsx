@@ -1,6 +1,7 @@
 import type { Metadata } from "next"
-import { LifeBuoy, ShieldCheck } from "lucide-react"
+import { ChevronDown, LifeBuoy, MessagesSquare, ShieldCheck } from "lucide-react"
 
+import { FollowUpForm } from "@/components/follow-up-form"
 import { PortalForm } from "@/components/portal-form"
 
 // The customer-facing surface, and the only route that is not part of the
@@ -51,6 +52,36 @@ export default function PortalPage() {
         <div className="rounded-2xl border bg-card px-5 py-6 shadow-sm sm:px-7 sm:py-7">
           <PortalForm />
         </div>
+
+        {/* Replying to an existing ticket is the second task on this page, and it is
+            the rarer one — so it is disclosed rather than laid out beside the form.
+            A native <details> because the platform already does this correctly:
+            keyboard reachable, announced as expanded or collapsed, and it needs no
+            client component and no state of its own. */}
+        <details className="group mt-4 overflow-hidden rounded-2xl border bg-card shadow-sm">
+          <summary className="focus-ring flex cursor-pointer list-none items-center justify-between gap-3 px-5 py-4 text-sm font-medium sm:px-7">
+            <span className="flex items-center gap-2.5">
+              <MessagesSquare
+                aria-hidden="true"
+                className="size-4 shrink-0 text-muted-foreground"
+              />
+              Already have a ticket? Send us an update
+            </span>
+            <ChevronDown
+              aria-hidden="true"
+              className="size-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-180"
+            />
+          </summary>
+          <div className="space-y-4 border-t px-5 py-5 sm:px-7">
+            <p className="text-[13px] leading-relaxed text-muted-foreground">
+              If something has changed — a correction, a cancellation, or anything
+              you want to add — send it here and it will be added to your ticket. If
+              it changes a decision we had already reached, that decision goes back
+              to a person before anything is acted on.
+            </p>
+            <FollowUpForm />
+          </div>
+        </details>
 
         <p className="mt-6 flex items-center justify-center gap-2 text-center text-xs leading-relaxed text-muted-foreground">
           <ShieldCheck aria-hidden="true" className="size-3.5 shrink-0" />

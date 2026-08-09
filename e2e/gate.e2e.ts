@@ -48,8 +48,9 @@ async function resetDemo() {
     body: "{}",
   })
   if (!response.ok) {
+    const text = await response.text().catch(() => "")
     throw new Error(
-      `The demo could not be reset (HTTP ${response.status}), so the queue is not at a known start state. Confirm the schema has been applied.`
+      `The demo could not be reset (HTTP ${response.status}: ${text}), so the queue is not at a known start state. Confirm the schema has been applied.`
     )
   }
 }

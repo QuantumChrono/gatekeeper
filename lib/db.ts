@@ -5,7 +5,9 @@ import { applicablePolicies, relatedTickets } from "@/lib/evidence"
 import type { TransitionStore } from "@/lib/workflow"
 import type {
   Analysis,
+  Conflict,
   Draft,
+  FollowUp,
   Policy,
   PriorTicket,
   Result,
@@ -40,7 +42,7 @@ const UNCONFIGURED =
 // `seed` is deliberately absent: it is tier-3 input for the AI stages, read
 // server-side by the pipeline, and it has no business in a page payload.
 const TICKET_COLUMNS =
-  "id,created_at,updated_at,subject,body,customer_name,customer_tier,order_value_cents,status,analysis,draft,verification,risk,execution_result,pipeline_error"
+  "id,created_at,updated_at,subject,body,customer_name,customer_tier,order_value_cents,status,analysis,draft,verification,risk,execution_result,pipeline_error,follow_ups,conflict"
 
 function reader() {
   if (!url || !anonKey) return null
@@ -207,10 +209,21 @@ export type PipelineTicket = {
   analysis: Analysis | null
   draft: Draft | null
   verification: Verification | null
+  /** Read by the conflict stage: the newest is what it judges, the rest is context. */
+  follow_ups: FollowUp[]
+  /** The finding that reopened this ticket, if one did. Kept across the new decision. */
+  conflict: Conflict | null
   seed: {
     analysis?: unknown
     draft?: unknown
     verification?: unknown
+    /**
+     * Tier-3 conflict finding. Absent from every seeded row on purpose:
+     * `detectConflict` derives its own deterministic finding from the message
+     * text, which is the only tier-3 that can respond to a message written after
+     * the row was seeded.
+     */
+    conflict?: unknown
   } | null
 }
 
@@ -223,7 +236,7 @@ export async function getPipelineTicket(
   const { data, error } = await db
     .from("tickets")
     .select(
-      "id,subject,body,customer_tier,order_value_cents,status,risk,analysis,draft,verification,seed"
+      "id,subject,body,customer_tier,order_value_cents,status,risk,analysis,draft,verification,follow_ups,conflict,seed"
     )
     .eq("id", id)
     .maybeSingle<PipelineTicket>()
@@ -345,4 +358,73 @@ export const store: TransitionStore = {
     }
     return { ok: true, data: undefined }
   },
+}
+
+/**
+ * Append one customer message to a ticket's follow-up log.
+ *
+ * Deliberately not on `TransitionStore` and deliberately not routed through
+ * `transition()`: a customer sending a message is not a decision and moves
+ * nothing. What it creates is the *grounds* a reopen later has to prove it has.
+ * That port exists as a seam for the state machine, and a write the state machine
+ * never makes does not belong in it.
+ *
+ * Hands back the log and the status the message landed on in one round trip, so
+ * the conflict check reads the state the append actually saw rather than racing a
+ * second read against it. `null` means no such ticket.
+ */
+export async function appendFollowUp(
+  ticketId: string,
+  message: string
+): Promise<Result<{ status: Status; followUps: FollowUp[] } | null>> {
+  const db = writer()
+  if (!db) return { ok: false, message: NO_WRITE_KEY }
+
+  // A postgres function for the same reason `apply` is one: the append, the row
+  // lock that keeps two simultaneous messages from overwriting each other, and
+  // the audit event share one transaction.
+  const { data, error } = await db.rpc("append_follow_up", {
+    p_id: ticketId,
+    p_message: message,
+  })
+
+  if (error) {
+    return {
+      ok: false,
+      message: `This message could not be added to the ticket: ${error.message}.`,
+    }
+  }
+  if (!data) return { ok: true, data: null }
+
+  const row = data as { status: Status; followUps: FollowUp[] }
+  return { ok: true, data: { status: row.status, followUps: row.followUps } }
+}
+
+/**
+ * Record a conflict check that ran and found nothing, without moving the ticket.
+ *
+ * The counterpart to a reopen, and the reason it is a separate call rather than a
+ * transition: a clean finding must be structurally incapable of moving anything,
+ * so it goes through an RPC that writes a self-edge event and the column, and has
+ * no status argument to get wrong.
+ */
+export async function recordConflictFinding(
+  ticketId: string,
+  conflict: Conflict
+): Promise<Result<void>> {
+  const db = writer()
+  if (!db) return { ok: false, message: NO_WRITE_KEY }
+
+  const { error } = await db.rpc("record_conflict_finding", {
+    p_id: ticketId,
+    p_conflict: conflict,
+  })
+
+  if (error) {
+    return {
+      ok: false,
+      message: `The follow-up was read, but the finding could not be recorded: ${error.message}.`,
+    }
+  }
+  return { ok: true, data: undefined }
 }

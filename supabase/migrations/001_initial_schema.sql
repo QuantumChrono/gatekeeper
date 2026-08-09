@@ -86,12 +86,35 @@ create table if not exists tickets (
       ('PASS','CONCERNS','FAIL'), false)
   ),
 
+  -- Customer messages that arrived after the ticket was opened, oldest first:
+  -- [{ at, message }]. Untrusted on the same terms as `body`, and kept separate
+  -- from it on purpose — `body` is what the analysis and every evidence quote
+  -- were drawn from, so rewriting it would make the record of the first decision
+  -- disagree with the decision itself.
+  follow_ups        jsonb not null default '[]'::jsonb,
+
+  -- The reconsideration verdict on the newest follow-up, once one has been
+  -- judged: { detected, followUpIndex, rationale, changedFacts[], confidence,
+  --   at, source, model }. Set when a follow-up is evaluated against a decision
+  -- a human already authorized; it is what justifies sending the ticket back to
+  -- the gate, and it stays on the row afterwards because it is a fact about what
+  -- happened rather than a flag to be tidied away.
+  conflict          jsonb,
+
+  constraint follow_ups_is_array check (jsonb_typeof(follow_ups) = 'array'),
+
   -- The state machine's core invariant, enforced by the database and not only by
-  -- the application: an executed ticket carries an execution result, and a
-  -- ticket that has not executed does not. A row claiming EXECUTED with nothing
-  -- executed, or an execution result on a ticket at RECEIVED, is unrepresentable.
+  -- the application: a ticket claiming EXECUTED carries the execution result
+  -- that proves it. A row at EXECUTED with nothing executed is unrepresentable.
+  --
+  -- An implication rather than an equality, because a decision can now be
+  -- reopened: a ticket that executed and was sent back for review by a customer
+  -- follow-up is no longer at EXECUTED but the action was still carried out, and
+  -- nulling the result to satisfy an equality would erase the record of the one
+  -- thing that actually happened. The half that matters is kept; the half that
+  -- would force a lie is dropped.
   constraint execution_result_only_when_executed check (
-    (status = 'EXECUTED') = (execution_result is not null)
+    status <> 'EXECUTED' or execution_result is not null
   )
 );
 
@@ -100,6 +123,21 @@ create table if not exists tickets (
 -- explicitly. Idempotent, and the guard on the constraints matters: adding them
 -- to a table holding rows that violate them would fail the whole script.
 alter table tickets add column if not exists pipeline_error jsonb;
+
+-- The reopen path (a customer follow-up that contradicts an authorized decision)
+-- needs these two. Added here as well as in the create above so a database from
+-- before the cycle existed gains them without being dropped and re-seeded.
+alter table tickets add column if not exists follow_ups jsonb not null default '[]'::jsonb;
+alter table tickets add column if not exists conflict jsonb;
+
+do $$ begin
+  if not exists (
+    select 1 from pg_constraint where conname = 'follow_ups_is_array'
+  ) then
+    alter table tickets add constraint follow_ups_is_array
+      check (jsonb_typeof(follow_ups) = 'array');
+  end if;
+end $$;
 
 do $$ begin
   -- The stored AI shapes changed to match the zod schemas in lib/ai/stages.ts,
@@ -135,12 +173,16 @@ do $$ begin
     raise notice 'verification_status_valid not applied: rows still hold the pre-schema verification shape. Run select reset_demo(); then re-run this file.';
   end if;
 
+  -- The implication form, matching the create above. A database that still holds
+  -- the old equality constraint is relaxed to this by the drop a few lines up,
+  -- which is what lets a reopened ticket keep the execution result proving the
+  -- action was carried out.
   if not exists (
     select 1 from tickets
-    where (status = 'EXECUTED') <> (execution_result is not null)
+    where status = 'EXECUTED' and execution_result is null
   ) then
     alter table tickets add constraint execution_result_only_when_executed check (
-      (status = 'EXECUTED') = (execution_result is not null)
+      status <> 'EXECUTED' or execution_result is not null
     );
   end if;
 end $$;
@@ -320,6 +362,30 @@ begin
     end if;
   end if;
 
+  -- The other edge whose violation would make Gatekeeper a lie, and the mirror of
+  -- the one above. A settled decision may be reopened, but only by something that
+  -- actually arrived: the conflict finding must travel with the move, and the
+  -- customer message it was found in must already be on the row. Asserted here as
+  -- well as in canTransition()/transition() because without it a bare rpc call
+  -- could bounce any executed ticket back to the gate with no stated cause, which
+  -- is a denial of service against the audit trail's meaning. Raises rather than
+  -- returning false: the application cannot produce this, so it is a defect or an
+  -- attack and it should be loud.
+  if p_expect in ('APPROVED','EXECUTED') and p_to <> 'EXECUTED' then
+    if p_patch->'conflict' is null then
+      raise exception
+        'Reopening a ticket at % requires the conflict finding that justifies it', p_expect;
+    end if;
+    if not exists (
+      select 1 from tickets
+      where id = p_id and jsonb_array_length(coalesce(follow_ups, '[]'::jsonb)) > 0
+    ) then
+      raise exception
+        'Reopening a ticket at % requires a recorded customer follow-up on ticket %',
+        p_expect, p_id;
+    end if;
+  end if;
+
   -- Conditional on the status the caller re-read and validated. If the row moved
   -- in between, this matches nothing and the audit event is never written.
   update tickets set
@@ -329,6 +395,11 @@ begin
     verification     = coalesce(p_patch->'verification', verification),
     risk             = coalesce(p_patch->>'risk', risk),
     execution_result = coalesce(p_patch->'execution_result', execution_result),
+    -- Kept on coalesce like every other artifact: a reopen writes the finding
+    -- that justified it, and the decision that follows does not erase it. The
+    -- execution_result above is preserved for the same reason — a reopened ticket
+    -- that had already executed still executed.
+    conflict         = coalesce(p_patch->'conflict', conflict),
     -- A stage that has now succeeded clears the failure it left behind.
     pipeline_error   = null
   where id = p_id and status = p_expect;
@@ -370,6 +441,79 @@ begin
   return true;
 end $fn$;
 
+-- A follow-up was judged and found *not* to contradict the authorized decision.
+-- Records the finding and moves nothing, exactly like record_pipeline_failure:
+-- from_status and to_status are both the ticket's current status, so a clean
+-- finding is structurally incapable of reopening anything.
+--
+-- It is written rather than discarded because a check that ran and found nothing
+-- is a different thing from no check at all, and only one of those is true. An
+-- operator seeing a follow-up on a settled ticket is entitled to know the system
+-- read it and why it left the decision standing.
+create or replace function record_conflict_finding(p_id uuid, p_conflict jsonb)
+returns boolean
+language plpgsql as $fn$
+declare
+  v_status ticket_status;
+begin
+  select status into v_status from tickets where id = p_id;
+  if v_status is null then return false; end if;
+
+  update tickets set conflict = p_conflict where id = p_id;
+
+  insert into ticket_events
+    (ticket_id, actor, from_status, to_status, reason, source, model)
+  values (p_id, 'ai', v_status, v_status,
+          concat('No conflict found. ', p_conflict->>'rationale',
+                 ' The ticket was left at ', v_status, '.'),
+          (p_conflict->>'source')::ai_source, p_conflict->>'model');
+
+  return true;
+end $fn$;
+
+-- A customer message that arrived after the ticket was opened. Appends to the
+-- follow-up log and moves nothing: from_status and to_status are both the
+-- ticket's current status, so a message cannot advance or reopen anything by
+-- itself. What it creates is the grounds a reopen later has to prove it has.
+--
+-- The event is written for the same reason receipt is: the arrival of new
+-- information is part of the record of why a decision was reconsidered, and a
+-- trail that showed the bounce without the message that caused it would be
+-- missing the cause.
+--
+-- Returns the whole log and the status it landed on, in one round trip, because
+-- the conflict check needs both and re-reading them separately would race with
+-- this append.
+create or replace function append_follow_up(p_id uuid, p_message text)
+returns jsonb
+language plpgsql as $fn$
+declare
+  v_status ticket_status;
+  v_entry  jsonb;
+  v_log    jsonb;
+begin
+  -- Locked for the read-modify-write below: two follow-ups landing together must
+  -- both survive, and a bare `follow_ups || entry` on an unlocked row can drop
+  -- one to a lost update.
+  select status into v_status from tickets where id = p_id for update;
+  if v_status is null then return null; end if;
+
+  v_entry := jsonb_build_object('at', now(), 'message', p_message);
+
+  update tickets set follow_ups = coalesce(follow_ups, '[]'::jsonb) || v_entry
+  where id = p_id
+  returning follow_ups into v_log;
+
+  insert into ticket_events
+    (ticket_id, actor, from_status, to_status, reason, source, model)
+  values (p_id, 'system', v_status, v_status,
+          concat('Customer follow-up received while the ticket was at ', v_status,
+                 '. Nothing has been inferred from it yet and nothing was authorized.'),
+          null, null);
+
+  return jsonb_build_object('status', v_status, 'followUps', v_log);
+end $fn$;
+
 -- The browser never writes (CLAUDE.md §7). RLS already denies anon every write,
 -- but a function reachable over PostgREST rpc is a second door: close it, so
 -- these are callable only by the service-role key the Server Actions use.
@@ -379,10 +523,14 @@ do $$ begin
       uuid, ticket_status, ticket_status, actor_kind, text, ai_source, text, jsonb
     ) from public;
     revoke execute on function record_pipeline_failure(uuid, jsonb) from public;
+    revoke execute on function append_follow_up(uuid, text) from public;
+    revoke execute on function record_conflict_finding(uuid, jsonb) from public;
     grant execute on function apply_transition(
       uuid, ticket_status, ticket_status, actor_kind, text, ai_source, text, jsonb
     ) to service_role;
     grant execute on function record_pipeline_failure(uuid, jsonb) to service_role;
+    grant execute on function append_follow_up(uuid, text) to service_role;
+    grant execute on function record_conflict_finding(uuid, jsonb) to service_role;
   end if;
 end $$;
 
@@ -941,11 +1089,17 @@ begin
 end $fn$;
 
 -- Reset to the demo start state: drop the tickets, which cascades their events
--- away with them, then re-seed. Called by the resetDemo() server action.
+-- away with them, then re-seed. Called by resetDemo() in the e2e specs.
 create or replace function reset_demo() returns void
 language plpgsql as $fn$
 begin
-  delete from tickets;
+  -- pg-safeupdate is preloaded on the PostgREST roles, so a bare `delete from
+  -- tickets` is refused with SQLSTATE 21000 ("DELETE requires a WHERE clause")
+  -- when this is reached over /rpc, though it runs fine in the SQL editor. Hence
+  -- the qual. `where true` would not do: the planner folds it away and the
+  -- statement arrives at the guard bare again. `now()` is stable rather than
+  -- constant-folded, so this one survives planning and still matches every row.
+  delete from tickets where created_at <= now();
   perform seed_demo_tickets();
 end $fn$;
 

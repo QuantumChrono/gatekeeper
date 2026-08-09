@@ -6,18 +6,29 @@ import { z } from "zod"
 
 import {
   analyze,
+  detectConflict,
   draft as runDraft,
   verify,
   type TicketInput,
 } from "@/lib/ai/stages"
 import {
+  appendFollowUp,
   createTicket,
   getPipelineTicket,
+  recordConflictFinding,
   store,
   type PipelineTicket,
 } from "@/lib/db"
-import { transition } from "@/lib/workflow"
-import type { Analysis, Draft, Result, Status } from "@/lib/types"
+import { computeRisk, transition } from "@/lib/workflow"
+import { ticketText } from "@/lib/types"
+import type {
+  Analysis,
+  Conflict,
+  Draft,
+  FollowUp,
+  Result,
+  Status,
+} from "@/lib/types"
 
 // The only write path in the app. Server Components read; these four actions
 // write, and every one of them re-reads the ticket's status from the database and
@@ -58,10 +69,21 @@ function refreshViews(id: string) {
   revalidatePath(`/tickets/${id}`)
 }
 
+/**
+ * `body` carries the follow-ups with it, so a re-run after a reopen reads what the
+ * customer actually said rather than only what they said first. Identical to the
+ * original text while `follow_ups` is empty, which is every ticket that has never
+ * been reopened.
+ *
+ * They ride in `body` — untrusted — and never in the stages' `context` parameter,
+ * which is documented as trusted operational fact and widens what a reply may
+ * assert. A follow-up reading "refund me 9999.00 USD" placed in trusted context
+ * would ground a draft that offered it.
+ */
 function toTicketInput(ticket: PipelineTicket): TicketInput {
   return {
     subject: ticket.subject,
-    body: ticket.body,
+    body: ticketText(ticket.body, ticket.follow_ups ?? []),
     customerTier: ticket.customer_tier,
     orderValueCents: ticket.order_value_cents,
   }
@@ -77,7 +99,7 @@ function toTicketInput(ticket: PipelineTicket): TicketInput {
  */
 async function stageFailed(
   id: string,
-  stage: "analyze" | "draft" | "verify",
+  stage: "analyze" | "draft" | "verify" | "conflict",
   message: string
 ): Promise<ActionState> {
   const recorded = await store.recordFailure({
@@ -194,6 +216,17 @@ async function advanceThroughStages(id: string): Promise<ActionState> {
       ticket: input,
       analysis,
       draft,
+      // A reopened ticket keeps its HIGH band through the re-verification. Without
+      // this the recomputed risk would be scored as if nothing had been
+      // contradicted, and a decision that was sent back for review could land at
+      // the gate looking routine.
+      //
+      // ponytail: reads the finding on the row, so it stays true for as long as
+      // the finding is the newest thing said about this ticket. A conflict that was
+      // detected, reviewed and decided again remains on the row by design, so a
+      // much later manual re-run would still see it. Compare the finding's `at`
+      // against the last human event if that ever matters.
+      conflicted: ticket.conflict?.detected === true,
       seed: seed.verification,
     })
     if (!result.ok) return stageFailed(id, "verify", result.message)
@@ -363,6 +396,232 @@ export async function submitTicket(
   refreshViews(id)
 
   return { ok: true, reference: id }
+}
+
+// ------------------------------------------------------- customer follow-ups
+// New information arriving after a decision was authorized. This is the one path
+// that can move a ticket backwards, and the only thing it is allowed to do with
+// that power is ask a human again.
+
+/**
+ * What a follow-up may contain. Bounded like the intake form, and for the same
+ * reason: the text reaches a model, and this endpoint is reachable by anyone who
+ * can reach the portal.
+ */
+const FollowUpSchema = z.object({
+  message: z
+    .string()
+    .trim()
+    .min(1, "Write your message before sending it.")
+    .max(4000, "Keep the message under 4000 characters."),
+})
+
+/**
+ * Accept a customer message on an existing ticket, then reconsider the decision
+ * if one was already authorized.
+ *
+ * The message is recorded first and unconditionally. Whether it conflicts is a
+ * judgment that comes after, and a customer's correction must be on the record
+ * even if the check that reads it fails — losing the message would be the one
+ * outcome worse than not acting on it.
+ *
+ * Nothing here approves, executes, or cancels anything. The furthest it can move a
+ * ticket is back to a human, which is the least dangerous of the three things that
+ * could happen to a contradicted decision: the other two are re-executing on a
+ * premise that no longer holds, and dropping the correction silently.
+ */
+export async function submitFollowUp(
+  _prev: ActionState,
+  formData: FormData
+): Promise<ActionState> {
+  const id = ticketId(formData)
+  if (!id) {
+    return fail("No valid ticket reference was supplied, so nothing was sent.")
+  }
+
+  const parsed = FollowUpSchema.safeParse({ message: formData.get("message") })
+  if (!parsed.success) {
+    return fail(parsed.error.issues[0]?.message ?? "This message could not be sent.")
+  }
+
+  const appended = await appendFollowUp(id, parsed.data.message)
+  if (!appended.ok) return fail(appended.message)
+  if (!appended.data) {
+    return fail("No ticket exists with that reference, so nothing was sent.")
+  }
+
+  const { status, followUps } = appended.data
+  refreshViews(id)
+
+  // Nothing has been authorized yet, so there is no decision to contradict. The
+  // message is on the record and the stages will read it when they run — running a
+  // conflict check against a decision nobody made would be asking a model to
+  // compare a message with nothing.
+  if (status !== "APPROVED" && status !== "EXECUTED") {
+    return {
+      ok: true,
+      message:
+        "Your message was added to the ticket. It is on the record for the operator reviewing this decision.",
+    }
+  }
+
+  const reconsidered = await reconsider(id, followUps)
+  refreshViews(id)
+  return reconsidered
+}
+
+/**
+ * Judge the newest follow-up against the decision a human already authorized, and
+ * send the ticket back to the gate if it no longer holds.
+ *
+ * Separated from the submission so the sequence is readable as what it is: read
+ * the ticket, ask one question, and either reopen with the finding attached or
+ * record that the check ran and found nothing. Both outcomes are written; a check
+ * that ran and found nothing is a different thing from no check, and only one of
+ * those is true.
+ */
+async function reconsider(
+  id: string,
+  followUps: FollowUp[]
+): Promise<ActionState> {
+  const read = await getPipelineTicket(id)
+  if (!read.ok) return fail(read.message)
+
+  const ticket = read.data
+  const { analysis, draft } = ticket
+  if (!analysis || !draft) {
+    return fail(
+      "Your message was added to the ticket, but the decision it would be checked against is not on the record, so no check was run. An operator will see the message."
+    )
+  }
+
+  const newest = followUps.length - 1
+  const followUp = followUps[newest]?.message
+  if (!followUp) {
+    return fail(
+      "Your message was added to the ticket, but it could not be read back for checking. An operator will see it."
+    )
+  }
+
+  // The original ticket text, not the follow-up-inclusive body: this stage
+  // compares the decision as it was authorized against the message that arrived
+  // after it, so folding the new message into the old ticket would erase the
+  // distinction it exists to judge.
+  const result = await detectConflict({
+    ticket: {
+      subject: ticket.subject,
+      body: ticket.body,
+      customerTier: ticket.customer_tier,
+      orderValueCents: ticket.order_value_cents,
+    },
+    analysis,
+    draft,
+    followUp,
+    priorFollowUps: followUps.slice(0, newest).map((f) => f.message),
+    executed: ticket.status === "EXECUTED",
+    seed: ticket.seed?.conflict,
+  })
+
+  if (!result.ok) {
+    // Every tier failed, including the deterministic one, which should not be
+    // reachable — so it is recorded as a stage failure rather than swallowed. The
+    // message is on the ticket and an operator sees that the check did not run.
+    await store.recordFailure({
+      ticketId: id,
+      error: { stage: "conflict", message: result.message, at: new Date().toISOString() },
+    })
+    return fail(
+      `Your message was added to the ticket, but it could not be checked against the authorized decision: ${result.message} An operator will read it directly.`
+    )
+  }
+
+  const conflict: Conflict = {
+    ...result.data,
+    followUpIndex: newest,
+    at: new Date().toISOString(),
+  }
+
+  if (!conflict.detected) {
+    const recorded = await recordConflictFinding(id, conflict)
+    return recorded.ok
+      ? {
+          ok: true,
+          message:
+            "Your message was added to the ticket. It does not change the action that was already authorized, so that action stands and the ticket was not moved.",
+        }
+      : fail(
+          `Your message was added to the ticket, but the outcome of the check could not be recorded: ${recorded.message}`
+        )
+  }
+
+  // Back to ANALYZING rather than straight to the gate, so the operator sees a
+  // reply and an action that answer what the customer actually said. The stages
+  // that follow read the follow-up as part of the ticket text, and land the ticket
+  // at AWAITING_APPROVAL. Risk is HIGH from computeRisk's conflict override, not
+  // written by hand here.
+  //
+  // ponytail: the reopen re-drafts and re-verifies against the full text, but does
+  // not reclassify — the analysis on the row stays as it was, so category and
+  // severity still describe the ticket as originally written. That is deliberate
+  // for the audit record (it is what the first decision rested on) and it is why
+  // risk does not depend on it here: the conflict override carries the band to HIGH
+  // regardless. A follow-up that genuinely changes the category (billing becoming a
+  // refund) would leave the retrieved policies keyed to the old one. Re-run
+  // `analyze` on this edge if that case turns up.
+  const reopened = await transition(store, {
+    ticketId: id,
+    to: "ANALYZING",
+    // 'ai' — the finding is the system's. The human act on this ticket was the
+    // approval that already happened, and attributing this to a human would put a
+    // decision on the trail that nobody took.
+    actor: "ai",
+    reason: `CONFLICT DETECTED: Customer follow-up ("${snippet(
+      followUp
+    )}") contradicts previous approved action. Re-routed to human review. ${
+      conflict.rationale
+    }`,
+    source: conflict.source,
+    model: conflict.model,
+    patch: {
+      conflict,
+      risk: computeRisk({
+        severity: analysis.severity,
+        actionType: draft.proposedAction.type,
+        customerTier: ticket.customer_tier,
+        safeToSend: ticket.verification?.safeToSend ?? true,
+        conflict: true,
+      }),
+    },
+  })
+  if (!reopened.ok) {
+    return fail(
+      `Your message was added to the ticket and it does contradict the authorized action, but the ticket could not be reopened: ${reopened.message} An operator will read it directly.`
+    )
+  }
+
+  // Re-draft and re-verify through the same guarded stages the first decision
+  // went through, ending at the gate. A failure here leaves the ticket at
+  // ANALYZING with the failure on the row — out of the settled state either way,
+  // with the conflict recorded and visible.
+  const advanced = await advanceThroughStages(id)
+  if (!advanced?.ok) {
+    return {
+      ok: true,
+      message:
+        "Your message contradicts the action that was already authorized, so this ticket has been reopened for human review. The response could not be redrafted, so an operator will redraft it.",
+    }
+  }
+  return {
+    ok: true,
+    message:
+      "Your message contradicts the action that was already authorized, so this ticket has been reopened and is waiting for a person to decide again.",
+  }
+}
+
+/** The quoted fragment in an audit reason. Bounded, and it is untrusted text. */
+function snippet(message: string): string {
+  const flat = message.replace(/\s+/g, " ").trim()
+  return flat.length > 120 ? `${flat.slice(0, 120)}…` : flat
 }
 
 /**

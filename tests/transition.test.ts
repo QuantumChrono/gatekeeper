@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest"
 
-import { canTransition, transition, type TransitionStore } from "../lib/workflow"
+import {
+  canTransition,
+  isReopen,
+  transition,
+  type TransitionPatch,
+  type TransitionStore,
+} from "../lib/workflow"
 import type { Actor, PipelineError, Status } from "../lib/types"
 
 // The state machine is the product's security boundary, so this suite tests the
@@ -19,7 +25,15 @@ const ALL: Status[] = [
   "EXECUTED",
 ]
 
-/** Every edge the workflow is specified to have, and no others. */
+/**
+ * Every edge the workflow is specified to have, and no others.
+ *
+ * The last four are the reopen path: new information can arrive after a decision
+ * was authorized, so a settled ticket can be sent back for a human to decide
+ * again. They are edges *out* of a settled decision and never a new way into one —
+ * `EXECUTED` still appears exactly once as a target, from `APPROVED` alone, which
+ * is the invariant the whole product rests on.
+ */
 const LEGAL: [Status, Status][] = [
   ["RECEIVED", "ANALYZING"],
   ["ANALYZING", "DRAFTED"],
@@ -28,7 +42,24 @@ const LEGAL: [Status, Status][] = [
   ["AWAITING_APPROVAL", "APPROVED"],
   ["AWAITING_APPROVAL", "REJECTED"],
   ["APPROVED", "EXECUTED"],
+  ["APPROVED", "ANALYZING"],
+  ["APPROVED", "AWAITING_APPROVAL"],
+  ["EXECUTED", "ANALYZING"],
+  ["EXECUTED", "AWAITING_APPROVAL"],
 ]
+
+/** A reopen needs its justification, so the guard requires this patch to be present. */
+const CONFLICT_PATCH = {
+  conflict: {
+    detected: true,
+    changedFacts: ["The customer withdrew the request the refund rested on."],
+    rationale: "The follow-up cancels the request that was approved.",
+    confidence: 0.8,
+    followUpIndex: 0,
+    at: "2026-01-01T00:00:00.000Z",
+    source: "model" as const,
+  },
+}
 
 type Event = {
   actor: Actor
@@ -47,10 +78,16 @@ type Event = {
  * prove only that the fake refuses illegal moves. The guard under test is
  * `transition()`, and the store here is as permissive as a raw UPDATE would be.
  */
-function fakeStore(initial: Status, seededEvents: Event[] = []) {
+function fakeStore(
+  initial: Status,
+  seededEvents: Event[] = [],
+  /** Customer messages on the row. A reopen requires at least one, as the schema does. */
+  followUps: number = 0
+) {
   const state = {
     status: initial as Status | null,
     events: [...seededEvents],
+    followUps,
     reads: 0,
     /** Runs between the read and the write, to stage a lost race. */
     onBeforeApply: undefined as undefined | (() => void),
@@ -61,7 +98,7 @@ function fakeStore(initial: Status, seededEvents: Event[] = []) {
       state.reads += 1
       return { ok: true, data: state.status }
     },
-    async apply({ expect: expected, to, actor, reason }) {
+    async apply({ expect: expected, to, actor, reason, patch }) {
       state.onBeforeApply?.()
 
       if (to === "EXECUTED") {
@@ -78,6 +115,24 @@ function fakeStore(initial: Status, seededEvents: Event[] = []) {
           return {
             ok: false,
             message: "EXECUTED requires a recorded human approval event",
+          }
+        }
+      }
+
+      // The reopen assertions apply_transition makes, mirrored: a settled decision
+      // is reopened only with the finding that justifies it and only when the
+      // customer message it was found in is actually on the row.
+      if ((expected === "APPROVED" || expected === "EXECUTED") && to !== "EXECUTED") {
+        if (!patch?.conflict) {
+          return {
+            ok: false,
+            message: `Reopening a ticket at ${expected} requires the conflict finding that justifies it`,
+          }
+        }
+        if (state.followUps === 0) {
+          return {
+            ok: false,
+            message: `Reopening a ticket at ${expected} requires a recorded customer follow-up`,
           }
         }
       }
@@ -111,8 +166,9 @@ const move = (
   store: TransitionStore,
   to: Status,
   actor: Actor = "human",
-  reason = "test"
-) => transition(store, { ticketId: "t1", to, actor, reason })
+  reason = "test",
+  patch?: TransitionPatch
+) => transition(store, { ticketId: "t1", to, actor, reason, patch })
 
 describe("canTransition", () => {
   it("permits every legal edge", () => {
@@ -138,14 +194,42 @@ describe("canTransition", () => {
     }
   })
 
-  it("treats the terminal statuses as terminal and rejects self-edges", () => {
+  it("keeps REJECTED terminal and rejects self-edges", () => {
+    // Nothing was authorized on a rejected ticket, so there is no decision to
+    // reconsider — a customer with more to say is opening a new ticket.
     for (const to of ALL) {
-      expect(canTransition("EXECUTED", to), `EXECUTED → ${to}`).toBe(false)
       expect(canTransition("REJECTED", to), `REJECTED → ${to}`).toBe(false)
     }
     // A self-transition is not a move, which is what keeps the failure path from
     // being able to advance anything.
     for (const s of ALL) expect(canTransition(s, s), `${s} → ${s}`).toBe(false)
+  })
+
+  it("lets a settled decision be reopened, but only into human review", () => {
+    // The cycle: new information can send an authorized or carried-out decision
+    // back to a human.
+    for (const from of ["APPROVED", "EXECUTED"] as const) {
+      expect(canTransition(from, "ANALYZING"), `${from} → ANALYZING`).toBe(true)
+      expect(
+        canTransition(from, "AWAITING_APPROVAL"),
+        `${from} → AWAITING_APPROVAL`
+      ).toBe(true)
+      // Reopening never skips the gate on the way back.
+      expect(canTransition(from, "APPROVED"), `${from} → APPROVED`).toBe(false)
+      expect(canTransition(from, "REJECTED"), `${from} → REJECTED`).toBe(false)
+    }
+    // And an executed ticket cannot execute a second time.
+    expect(canTransition("EXECUTED", "EXECUTED")).toBe(false)
+  })
+
+  it("names exactly the reopen edges", () => {
+    for (const from of ALL) {
+      for (const to of ALL) {
+        const reopen =
+          (from === "APPROVED" || from === "EXECUTED") && to !== "EXECUTED"
+        expect(isReopen(from, to), `${from} → ${to}`).toBe(reopen)
+      }
+    }
   })
 
   it("does not skip the gate", () => {
@@ -295,6 +379,100 @@ describe("transition", () => {
     // Idempotent: a second execute authorizes nothing and writes no second event.
     expect(result).toEqual({ ok: true, data: { status: "EXECUTED", changed: false } })
     expect(state.events).toHaveLength(2)
+  })
+
+  it("reopens an executed decision into human review, with the finding attached", async () => {
+    const { store, state } = fakeStore(
+      "EXECUTED",
+      [
+        { actor: "human", from: "AWAITING_APPROVAL", to: "APPROVED", reason: "ok" },
+        { actor: "human", from: "APPROVED", to: "EXECUTED", reason: "carried out" },
+      ],
+      1
+    )
+
+    const result = await move(
+      store,
+      "ANALYZING",
+      "ai",
+      "CONFLICT DETECTED: the customer withdrew the request.",
+      CONFLICT_PATCH
+    )
+
+    expect(result).toEqual({ ok: true, data: { status: "ANALYZING", changed: true } })
+    expect(state.status).toBe("ANALYZING")
+    // The reason the ticket moved backwards is on the trail, attributed to the
+    // system that found it rather than to a human who decided nothing.
+    expect(state.events.at(-1)).toMatchObject({
+      actor: "ai",
+      from: "EXECUTED",
+      to: "ANALYZING",
+    })
+    expect(state.events.at(-1)?.reason).toContain("CONFLICT DETECTED")
+  })
+
+  it("refuses to reopen a settled decision with no conflict finding behind it", async () => {
+    // The abuse case: anyone who can POST bouncing a carried-out decision back to
+    // the gate. Without grounds the move is refused, so the trail cannot be filled
+    // with unexplained reversals.
+    for (const from of ["APPROVED", "EXECUTED"] as const) {
+      for (const to of ["ANALYZING", "AWAITING_APPROVAL"] as const) {
+        const { store, state } = fakeStore(
+          from,
+          [
+            { actor: "human", from: "AWAITING_APPROVAL", to: "APPROVED", reason: "ok" },
+          ],
+          1
+        )
+
+        const result = await move(store, to, "ai", "no reason given")
+
+        expect(result.ok, `${from} → ${to} without a finding`).toBe(false)
+        expect(state.status).toBe(from)
+        expect(state.events).toHaveLength(1)
+      }
+    }
+  })
+
+  it("refuses to reopen when no customer message is on the ticket", async () => {
+    // The finding is present but nothing actually arrived. The database asserts
+    // this too, and it is what stops a fabricated finding from moving a ticket.
+    const { store, state } = fakeStore(
+      "EXECUTED",
+      [
+        { actor: "human", from: "AWAITING_APPROVAL", to: "APPROVED", reason: "ok" },
+        { actor: "human", from: "APPROVED", to: "EXECUTED", reason: "carried out" },
+      ],
+      0
+    )
+
+    const result = await move(store, "ANALYZING", "ai", "conflict", CONFLICT_PATCH)
+
+    expect(result.ok).toBe(false)
+    expect(state.status).toBe("EXECUTED")
+    expect(state.events).toHaveLength(2)
+  })
+
+  it("cannot re-execute a reopened ticket without a fresh human approval", async () => {
+    // The property that makes the cycle safe: coming back round, EXECUTED is still
+    // only reachable from APPROVED, so the ticket has to pass a human again.
+    const { store, state } = fakeStore(
+      "EXECUTED",
+      [
+        { actor: "human", from: "AWAITING_APPROVAL", to: "APPROVED", reason: "ok" },
+        { actor: "human", from: "APPROVED", to: "EXECUTED", reason: "carried out" },
+      ],
+      1
+    )
+
+    await move(store, "AWAITING_APPROVAL", "ai", "conflict", CONFLICT_PATCH)
+    expect(state.status).toBe("AWAITING_APPROVAL")
+
+    // Straight back to executed, skipping the gate. Refused, even though this
+    // ticket carries a human approval event from its first pass.
+    const skipped = await move(store, "EXECUTED")
+    expect(skipped.ok).toBe(false)
+    expect(state.status).toBe("AWAITING_APPROVAL")
   })
 
   it("reports a missing ticket instead of writing", async () => {

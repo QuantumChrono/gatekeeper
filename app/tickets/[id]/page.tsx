@@ -7,7 +7,9 @@ import {
   Gavel,
   History,
   Lock,
+  MessagesSquare,
   Quote,
+  RefreshCcw,
   TriangleAlert,
   ShieldCheck,
   User,
@@ -26,6 +28,7 @@ import {
 } from "@/components/badges"
 import { ConsoleShell } from "@/components/console-shell"
 import { DecisionControls } from "@/components/decision-controls"
+import { FollowUpForm } from "@/components/follow-up-form"
 import { Notice } from "@/components/notice"
 import { Badge } from "@/components/ui/badge"
 import { getTicket } from "@/lib/db"
@@ -36,9 +39,11 @@ import {
   formatTimestamp,
   tierLabel,
 } from "@/lib/format"
-import { verifiedEvidence } from "@/lib/types"
+import { TERMINAL, ticketText, verifiedEvidence } from "@/lib/types"
 import type {
   Actor,
+  Conflict,
+  FollowUp,
   Policy,
   PriorTicket,
   Ticket,
@@ -223,12 +228,186 @@ function Header({ ticket }: { ticket: Ticket }) {
 }
 
 /**
+ * A decision that was authorized, and a customer message that contradicts it.
+ *
+ * The loudest thing on the page when it is present, and above the proposed action
+ * on purpose: everything below it was drafted against facts this message changed,
+ * so an operator needs to know that before they read any of it. Amber and glowing,
+ * reusing the badge variant the app already has for elevated attention — a new
+ * colour would break the one-accent rule in CLAUDE.md §6, and amber is already
+ * this app's word for "a human needs to look at this".
+ *
+ * Status is not carried by colour alone: the badge has a label and an icon, and the
+ * rationale underneath says what changed in words.
+ */
+function ConflictBanner({
+  conflict,
+  followUp,
+}: {
+  conflict: Conflict
+  followUp?: FollowUp
+}) {
+  return (
+    <section
+      // Not role="alert": that would override the implicit `region` a named
+      // section carries, and the reopened-decision banner has to stay findable
+      // as one — by an operator's landmark navigation and by the e2e spec alike.
+      // These two attributes are what role="alert" is defined as, so the
+      // announcement on reopen survives (CLAUDE.md §6).
+      aria-live="assertive"
+      aria-atomic="true"
+      aria-labelledby="conflict"
+      className="overflow-hidden rounded-md border border-warning/50 bg-warning/[0.06] shadow-sm"
+    >
+      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 border-b border-warning/30 bg-warning/[0.08] px-5 py-3">
+        <h2 id="conflict" className="flex items-center gap-2 text-sm font-semibold tracking-tight text-warning">
+          <RefreshCcw aria-hidden="true" className="size-4" />
+          Context conflict detected — re-routed for human review
+        </h2>
+        <Badge variant="security" className="gap-2.5">
+          <TriangleAlert aria-hidden="true" className="size-3" />
+          CONTEXT CONFLICT
+        </Badge>
+      </div>
+
+      <div className="space-y-3.5 px-5 py-4">
+        <p className="text-[13px] leading-relaxed">
+          A customer message arrived after this decision was authorized, and it
+          contradicts what was approved. The ticket was sent back to this gate
+          rather than acted on, and nothing further has been carried out.
+        </p>
+
+        {followUp ? (
+          <figure className="space-y-1.5">
+            <figcaption className="label-xs">
+              The message that changed it
+            </figcaption>
+            {/* Untrusted customer text, rendered as text like every other quote
+                of it on this page. */}
+            <blockquote className="rounded-md rounded-l-none border border-l-2 border-warning/30 border-l-warning/60 bg-card px-4 py-3">
+              <p className="text-sm leading-relaxed whitespace-pre-wrap">
+                {followUp.message}
+              </p>
+            </blockquote>
+            <p className="font-mono text-[11px] text-muted-foreground tabular-nums">
+              Received {formatTimestamp(followUp.at)}
+            </p>
+          </figure>
+        ) : null}
+
+        {conflict.changedFacts.length > 0 ? (
+          <div className="space-y-2">
+            <p className="label-xs">
+              {conflict.changedFacts.length}{" "}
+              {conflict.changedFacts.length === 1 ? "fact" : "facts"} the
+              follow-up changed
+            </p>
+            <ul className="space-y-1.5">
+              {conflict.changedFacts.map((fact) => (
+                <li
+                  key={fact}
+                  className="flex gap-2.5 rounded-sm border border-warning/25 bg-card px-3 py-2.5 text-[13px] leading-relaxed"
+                >
+                  <TriangleAlert
+                    aria-hidden="true"
+                    className="mt-0.5 size-3.5 shrink-0 text-warning"
+                  />
+                  <span className="min-w-0">{fact}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+
+        <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-2 border-t border-warning/25 pt-3">
+          <p className="min-w-0 flex-1 text-[13px] leading-relaxed text-muted-foreground">
+            {conflict.rationale}
+          </p>
+          <div className="flex items-center gap-2.5">
+            <span className="label-xs">Confidence</span>
+            <ConfidenceValue value={conflict.confidence} />
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+          <p className="font-mono text-[11px] text-muted-foreground tabular-nums">
+            Found {formatTimestamp(conflict.at)}
+          </p>
+          <ProvenanceBadge
+            source={conflict.source}
+            model={conflict.model}
+            degraded={conflict.degraded}
+          />
+        </div>
+      </div>
+    </section>
+  )
+}
+
+/**
+ * Everything the customer has said since the ticket was opened.
+ *
+ * Shown inside the evidence section rather than as a section of its own: these are
+ * customer words, which is what that section holds, and the priority order in
+ * CLAUDE.md §6 does not have a slot for a seventh heading. The message that drove a
+ * conflict is marked, because on a ticket with several follow-ups "which one
+ * reopened this" is the question an operator has.
+ */
+function FollowUpThread({
+  followUps,
+  conflictIndex,
+}: {
+  followUps: FollowUp[]
+  conflictIndex?: number
+}) {
+  return (
+    <ul className="space-y-2">
+      {followUps.map((followUp, i) => {
+        const drove = i === conflictIndex
+        return (
+          <li
+            key={`${followUp.at}-${i}`}
+            className={cn(
+              "rounded-md border px-3.5 py-3",
+              drove ? "border-warning/40 bg-warning/[0.04]" : "bg-card"
+            )}
+          >
+            <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+              <p className="label-xs">Follow-up {i + 1}</p>
+              <span className="font-mono text-[11px] text-muted-foreground tabular-nums">
+                {formatTimestamp(followUp.at)}
+              </span>
+            </div>
+            {/* Untrusted, rendered as text. */}
+            <p className="mt-1.5 text-[13px] leading-relaxed whitespace-pre-wrap">
+              {followUp.message}
+            </p>
+            {drove ? (
+              <p className="mt-2 flex items-center gap-1.5 text-xs text-warning">
+                <TriangleAlert aria-hidden="true" className="size-3 shrink-0" />
+                This message contradicted the authorized decision.
+              </p>
+            ) : null}
+          </li>
+        )
+      })}
+    </ul>
+  )
+}
+
+/**
  * The risk inputs, named. Risk itself is computed in code from these four
  * values, so listing them is what keeps a HIGH from being unexplained
  * (AC-7). The arithmetic lands with computeRisk(); these are its inputs as
  * they stand on this ticket.
  */
-function RiskFactors({ ticket }: { ticket: Ticket }) {
+function RiskFactors({
+  ticket,
+  conflicted,
+}: {
+  ticket: Ticket
+  conflicted: boolean
+}) {
   if (!ticket.risk) return null
   const factors = [
     { label: "Severity", value: ticket.analysis?.severity ?? "unknown" },
@@ -251,6 +430,24 @@ function RiskFactors({ ticket }: { ticket: Ticket }) {
   return (
     <div className="rounded-md border bg-muted/25 px-3.5 py-3">
       <p className="label-xs">Risk computed from</p>
+      {/* The conflict override, stated rather than left to be inferred. It does not
+          compete on points with the factors below — it sets the band outright — so
+          listing only those four would show an operator a set of inputs that does
+          not add up to the HIGH they are looking at, which is exactly the
+          unexplained risk CLAUDE.md §6 calls a defect. */}
+      {conflicted ? (
+        <p className="mt-2 flex items-start gap-2 text-[13px] leading-relaxed">
+          <TriangleAlert
+            aria-hidden="true"
+            className="mt-0.5 size-3.5 shrink-0 text-warning"
+          />
+          <span>
+            <span className="font-medium">Set to HIGH by the context conflict.</span>{" "}
+            A decision was already authorized on facts a later customer message
+            changed, so the band is not scored from the factors below.
+          </span>
+        </p>
+      ) : null}
       <dl className="mt-2 flex flex-wrap gap-x-6 gap-y-2 text-[13px]">
         {factors.map(({ label, value }) => (
           <div key={label} className="flex items-baseline gap-1.5">
@@ -511,7 +708,21 @@ export default async function TicketPage(props: PageProps<"/tickets/[id]">) {
 
   const { ticket, events, policies, related } = result.data
   const { analysis, draft, verification } = ticket
-  const evidence = analysis ? verifiedEvidence(analysis.evidence, ticket.body) : []
+  const followUps = ticket.follow_ups ?? []
+  // Matched against everything the customer has written, not the original message
+  // alone. After a reopen the stages read the follow-ups too, so a quote drawn from
+  // one is legitimate — matching against `body` alone would silently drop it, which
+  // is the same defect verifiedEvidence exists to prevent, pointing the other way.
+  const evidence = analysis
+    ? verifiedEvidence(analysis.evidence, ticketText(ticket.body, followUps))
+    : []
+  // A conflict that was found and is still the newest thing said about this ticket.
+  // The finding stays on the row after the ticket is decided again — it is a record
+  // of what happened — so what makes it *live* is the ticket sitting back in the
+  // workflow because of it, not the column being populated.
+  const conflict = ticket.conflict?.detected ? ticket.conflict : null
+  const conflictOpen =
+    conflict !== null && !TERMINAL.includes(ticket.status) && ticket.status !== "APPROVED"
   const atGate = ticket.status === "AWAITING_APPROVAL"
   const blocked = verification ? !verification.safeToSend : false
   const hasVerificationIssues = verification ? verification.issues.length > 0 : false
@@ -531,6 +742,16 @@ export default async function TicketPage(props: PageProps<"/tickets/[id]">) {
     <ConsoleShell activeStatus={ticket.status}>
     <div className="mx-auto max-w-3xl space-y-8 px-5 py-6 lg:px-8 lg:py-8">
       <Header ticket={ticket} />
+
+      {/* Above the proposed action, and the only thing allowed above it:
+          everything below was drafted against facts this message changed, so an
+          operator has to know that before reading any of it. */}
+      {conflictOpen && conflict ? (
+        <ConflictBanner
+          conflict={conflict}
+          followUp={followUps[conflict.followUpIndex]}
+        />
+      ) : null}
 
       {/* 1 — what am I being asked to authorize */}
       <Section
@@ -569,7 +790,7 @@ export default async function TicketPage(props: PageProps<"/tickets/[id]">) {
                 {draft.proposedAction.rationale}
               </p>
             </div>
-            <RiskFactors ticket={ticket} />
+            <RiskFactors ticket={ticket} conflicted={conflictOpen} />
           </div>
         ) : (
           <NotYet>
@@ -642,7 +863,30 @@ export default async function TicketPage(props: PageProps<"/tickets/[id]">) {
             >
               <p className={cn("text-sm leading-relaxed whitespace-pre-wrap", hasVerificationIssues && "text-foreground")}>{ticket.body}</p>
             </div>
+            {/* The original message stays exactly as it arrived, and follow-ups sit
+                below it rather than being folded into it. That separation is the
+                record: the analysis and every evidence quote on this page were drawn
+                from the text above, and rewriting it would make the account of the
+                first decision disagree with the decision itself. */}
+            {followUps.length > 0 ? (
+              <p className="text-xs text-muted-foreground">
+                The original message, as it arrived. Later messages are below.
+              </p>
+            ) : null}
           </div>
+
+          {followUps.length > 0 ? (
+            <div className="space-y-2">
+              <p className="label-xs flex items-center gap-1.5">
+                <MessagesSquare aria-hidden="true" className="size-3.5" />
+                Later messages from the customer
+              </p>
+              <FollowUpThread
+                followUps={followUps}
+                conflictIndex={conflict?.followUpIndex}
+              />
+            </div>
+          ) : null}
 
           {analysis ? (
             <>
@@ -955,9 +1199,44 @@ export default async function TicketPage(props: PageProps<"/tickets/[id]">) {
         </Section>
       ) : null}
 
+      {/* Below the audit trail, because the priority order in CLAUDE.md §6 is fixed
+          and this is not part of the decision: it stands in for the customer, who
+          has no seat at this console. Its own card rather than a numbered section
+          for the same reason. */}
+      <section
+        aria-labelledby="simulate-reply"
+        className="rounded-md border border-dashed bg-muted/25 px-5 py-4"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+          <h2
+            id="simulate-reply"
+            className="flex items-center gap-2 text-sm font-semibold tracking-tight"
+          >
+            <MessagesSquare aria-hidden="true" className="size-4" />
+            Simulate a customer reply
+          </h2>
+          <Badge
+            variant="outline"
+            className="rounded-sm border-border/80 px-1.5 font-mono text-[11px] tracking-wide text-muted-foreground uppercase"
+          >
+            Demo control
+          </Badge>
+        </div>
+        <p className="mt-2 text-[13px] leading-relaxed text-muted-foreground">
+          Stands in for the customer sending another message. Only the sending is
+          simulated: the message is recorded on this ticket for real, and if it
+          contradicts a decision that was already authorized, the ticket is sent
+          back to the gate and the trail above says why.
+        </p>
+        <div className="mt-3.5">
+          <FollowUpForm ticketId={ticket.id} simulated />
+        </div>
+      </section>
+
       <p className="border-t pt-4 pb-2 text-xs text-muted-foreground">
         Executed is reachable only from Approved, re-validated server-side on
-        every call.
+        every call. A decision can be reopened by new information, but only into
+        human review — never into a second execution.
       </p>
     </div>
     </ConsoleShell>

@@ -72,6 +72,7 @@ type Provenance = {
 // nothing else does.
 import type {
   AnalysisFields,
+  ConflictFields,
   DraftFields,
   VerificationFields,
 } from "@/lib/ai/stages"
@@ -100,7 +101,7 @@ export type Verification = VerificationFields &
  * failure therefore cannot advance anything, which is the property worth having.
  */
 export type PipelineError = {
-  stage: "analyze" | "draft" | "verify" | "pipeline"
+  stage: "analyze" | "draft" | "verify" | "conflict" | "pipeline"
   message: string
   at: string
 }
@@ -111,6 +112,37 @@ export type ExecutionResult = {
   simulated: boolean
   detail: string
 }
+
+/**
+ * A message the customer sent after the ticket was opened — a reply, a
+ * correction, extra context.
+ *
+ * Untrusted on exactly the same terms as `body`, and stored separately from it
+ * rather than appended to it: the original text is what the analysis and every
+ * evidence quote were drawn from, and rewriting it would make the record of the
+ * first decision disagree with the decision itself.
+ */
+export type FollowUp = {
+  at: string
+  message: string
+}
+
+/**
+ * The reconsideration verdict on the newest follow-up: does it contradict what a
+ * human already authorized?
+ *
+ * Recorded rather than re-derived, for the same reason `safeToSend` is: it is the
+ * finding that sent the ticket back to the gate, the risk band rests on it, and
+ * the audit trail names it. Kept on the row after the ticket is decided again —
+ * it is a fact about what happened, not a flag to be tidied away.
+ */
+export type Conflict = ConflictFields &
+  Provenance & {
+    /** Which follow-up was judged. Indexes into `follow_ups`. */
+    followUpIndex: number
+    /** When the finding was made, which is not when the follow-up arrived. */
+    at: string
+  }
 
 export type Ticket = {
   id: string
@@ -129,6 +161,10 @@ export type Ticket = {
   execution_result: ExecutionResult | null
   /** Set when an AI stage failed. The ticket did not move; this says why. */
   pipeline_error: PipelineError | null
+  /** Customer messages that arrived after the ticket was opened, oldest first. */
+  follow_ups: FollowUp[]
+  /** The reconsideration verdict on the newest follow-up, once one has been judged. */
+  conflict: Conflict | null
 }
 
 export type TicketEvent = {
@@ -203,4 +239,29 @@ export const TERMINAL: readonly Status[] = ["EXECUTED", "REJECTED"]
  */
 export function verifiedEvidence(quotes: string[], body: string): string[] {
   return quotes.filter((q) => body.includes(q))
+}
+
+/**
+ * Everything the customer has written on this ticket: the original message and
+ * every follow-up, in order.
+ *
+ * One definition, used by both the AI stages (as the untrusted text they read)
+ * and the detail view (as what evidence quotes are matched against). They have to
+ * agree: a re-analysis prompted with a follow-up will quote it, and if the screen
+ * matched quotes against `body` alone those quotes would silently disappear —
+ * which is the same class of defect `verifiedEvidence` exists to prevent, just
+ * pointing the other way.
+ *
+ * Follow-ups are untrusted on exactly the same terms as `body`, which is why they
+ * are concatenated into it rather than passed as `context`: `context` is trusted
+ * operational fact and widens what a reply may assert as true, so a customer
+ * writing "refund me 9999.00 USD" into trusted context would ground a draft that
+ * offered it.
+ */
+export function ticketText(body: string, followUps: FollowUp[]): string {
+  if (followUps.length === 0) return body
+  return [
+    body,
+    ...followUps.map((f) => `\n[Customer follow-up]\n${f.message}`),
+  ].join("\n")
 }
